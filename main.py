@@ -2,20 +2,19 @@
 """
 Validate names in Excel 'A. Process' and 'B. Business Object' against a Blue Prism release XML.
 
-Key points:
-- Duplicates the target sheet (Excel-level copy; preserves shapes/objects/formatting)
-- Adds a 'Validation' column at the end of the section header
-- Writes text + color: Exists=green, Does not exist=red, Newly added=orange
-- Inserts new rows for XML-only names (objects move with cells; borders kept)
-- Continues 'No.' numbering for inserted rows
-- Clears only the fill (not borders) in 'Check' for inserted rows
-- Section B stops at C/D/E; section ends trimmed to the last numbered/real row
+Improvements in this version:
+- Missing XML names first fill existing blank Name rows inside the section (even if 'No.' already has 4/5/etc),
+  then append new rows only if needed.
+- 'No.' numbering continues: if a fillable row has a blank No., it gets the next number; if it already has a number, we keep it.
+- Section ends are trimmed to the last real row (prefer 'No.' numeric; else any non-blank cell; else last non-blank Name).
+- Validation writes both TEXT ("Exists", "Does not exist", "Newly added") and color (green/red/orange).
+- Borders/formatting preserved; embedded objects set to "move with cells" during edits and restored after.
 """
 
 import argparse
 import re
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import pandas as pd
 import xlwings as xw
@@ -92,7 +91,7 @@ def find_section(
     section_keywords: List[str],
     header_keyword: str = "name",
     next_section_groups: Optional[List[List[str]]] = None,
-):
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
     """
     Locate a section and its coarse boundaries (will be trimmed later):
       - marker row contains all 'section_keywords' (['A.', 'Process'] or ['B.', 'Business Object'])
@@ -325,15 +324,33 @@ def insert_row_with_style(ws, row_num: int) -> None:
 
 # =============== Planning helpers ===============
 
-def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str], label: str,
-                 header_keyword: str = "name", next_section_groups: Optional[List[List[str]]] = None) -> Optional[Dict[str, Any]]:
-    """
-    Build a plan describing how to write Validation and where to insert new rows.
+def _row_has_any_nonblank(series: pd.Series) -> bool:
+    """True if any cell in the row is non-blank (after strip)."""
+    return any(str(v).strip() != "" for v in list(series.values))
 
-    IMPORTANT TRIM: after coarse end is found, we trim the section to the **last real row**:
-      1) Prefer the last row whose 'No.' column contains a number;
-      2) Else, the last row with any non-blank cell in the row;
-      3) Else, fall back to the last row with a non-blank Name.
+
+def plan_section(
+    df: pd.DataFrame,
+    section_keys: List[str],
+    xml_names: List[str],
+    label: str,
+    header_keyword: str = "name",
+    next_section_groups: Optional[List[List[str]]] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Build a plan describing how to write Validation and where to fill/insert rows.
+
+    TRIMMING:
+      - Start from header+1, end at first next header (coarse), then trim to the last real row:
+          1) prefer last row with numeric 'No.'; else
+          2) last row with ANY non-blank cell; else
+          3) last row with a non-blank 'Name'.
+
+    FILLABLE ROWS:
+      - Rows inside the trimmed section where 'Name' is blank but the row is still "in the table":
+          * 'No.' has a number, OR
+          * any other cell is non-blank.
+      We will place "Newly added" names into these rows before resorting to inserts.
     """
     found = find_section(df, section_keys, header_keyword=header_keyword, next_section_groups=next_section_groups)
     content_start, content_end_coarse, name_col, header_row_idx, _ = found
@@ -341,7 +358,7 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
         return None
 
     header_row = df.iloc[header_row_idx]
-    # Determine where to place 'Validation' (reuse if already present)
+    # Validation column position (reuse if already present)
     validation_col = None
     for col_idx, val in header_row.items():
         if _norm_cell(val) == "validation":
@@ -350,7 +367,7 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
     if validation_col is None:
         validation_col = _last_nonempty_col_index(header_row) + 1
 
-    # Identify helper columns
+    # Helper columns
     no_col    = find_no_col_in_header(df, header_row_idx)
     check_col = find_check_col_in_header(df, header_row_idx)
 
@@ -359,7 +376,12 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
 
     # (A) last row with a numeric "No."
     last_rel_by_no = None
+    max_no = None
     if no_col is not None and no_col < coarse_df.shape[1]:
+        for i in range(len(coarse_df)):
+            val = _extract_int(coarse_df.iat[i, no_col])
+            if val is not None:
+                max_no = val if (max_no is None or val > max_no) else max_no
         for i in range(len(coarse_df) - 1, -1, -1):
             val = _extract_int(coarse_df.iat[i, no_col])
             if val is not None:
@@ -369,8 +391,7 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
     # (B) last row with any non-blank cell
     last_rel_by_any = None
     for i in range(len(coarse_df) - 1, -1, -1):
-        row_vals = [str(v).strip() for v in list(coarse_df.iloc[i].values)]
-        if any(v != "" for v in row_vals):
+        if _row_has_any_nonblank(coarse_df.iloc[i]):
             last_rel_by_any = i
             break
 
@@ -393,10 +414,10 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
     true_end_rel_exclusive = last_rel + 1 if last_rel >= 0 else 0
     true_end_abs_exclusive = content_start + true_end_rel_exclusive  # 0-based exclusive
 
-    # Build section slice trimmed to the last real row
+    # Build the trimmed section slice
     section_df = df.iloc[content_start:true_end_abs_exclusive].copy().reset_index(drop=True)
 
-    # Names and validation statuses for the trimmed region
+    # Names + validation for existing (trimmed) rows
     name_series = section_df[name_col].astype(str).fillna("").str.strip()
     excel_names = name_series.tolist()
     xml_set     = {x.strip() for x in xml_names}
@@ -404,31 +425,39 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
     validation_vals = []
     for nm in excel_names:
         if not nm:
-            validation_vals.append("")         # keep truly empty Name rows unlabelled
+            validation_vals.append("")         # unlabelled for truly blank Name rows (will be filled later if missing)
         elif nm in xml_set:
             validation_vals.append("Exists")
         else:
             validation_vals.append("Does not exist")
 
-    # Missing names to append
+    # Missing names to place
     excel_set = {n for n in excel_names if n}
     missing   = [n for n in xml_names if n not in excel_set]
 
-    # Insert position: AFTER the last real row we just computed
+    # Fillable rows (relative indices) inside the trimmed region
+    fillable_rel = []
+    for i in range(section_df.shape[0]):
+        nm = str(section_df.iat[i, name_col]).strip()
+        if nm != "":
+            continue
+        row = section_df.iloc[i]
+        has_no_num = (_extract_int(row[name_col*0 + no_col]) is not None) if (no_col is not None and no_col < len(row)) else False
+        has_other  = any((str(row[j]).strip() != "" and j != name_col) for j in range(len(row)))
+        if has_no_num or has_other:
+            fillable_rel.append(i)
+
+    # Insert anchor: AFTER the last real row we just computed
     last_abs = content_start + (true_end_rel_exclusive - 1) if true_end_rel_exclusive > 0 else header_row_idx
-    insert_after_abs = last_abs
-    insert_at_excel_row = insert_after_abs + 2  # Excel is 1-based; +1 to move after; +1 for 1-based
+    insert_at_excel_row = last_abs + 2  # Excel 1-based & "+1 after"
 
     # Next value for No.
-    next_no = None
-    if no_col is not None and true_end_rel_exclusive > 0:
-        parsed = _extract_int(section_df.iat[true_end_rel_exclusive - 1, no_col])
-        if parsed is not None:
-            next_no = parsed + 1
-        else:
-            next_no = int(sum(1 for v in excel_names if v)) + 1
-    elif no_col is not None:
-        next_no = 1
+    # Prefer the maximum existing No. found in the coarse region; else count existing non-blank Names.
+    if max_no is not None:
+        next_no = max_no + 1
+    else:
+        nonblank_names = sum(1 for v in excel_names if v)
+        next_no = nonblank_names + 1 if no_col is not None else None
 
     return {
         "label": label,
@@ -447,6 +476,7 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
         "validation_vals": validation_vals,
         "missing": missing,
         "next_no": next_no,
+        "fillable_rel": fillable_rel,  # relative indices (0..section_row_count-1)
     }
 
 
@@ -493,6 +523,112 @@ def _sheet_by_name_or_index(wb, sheet_arg):
 
 # =============== Main workflow ===============
 
+def _write_existing_validation(ws, plan: Dict[str, Any]) -> None:
+    """Write Validation TEXT + color for existing rows inside the trimmed section."""
+    val_col_excel = plan["validation_col"] + 1
+    start_row     = plan["section_first_excel_row"]
+    for i, status in enumerate(plan["validation_vals"]):
+        r = start_row + i
+        paste_formats_like_left(ws, r, val_col_excel)
+        if status:
+            ws.range((r, val_col_excel)).value = status
+        else:
+            ws.range((r, val_col_excel)).value = ""
+        st = (status or "").lower()
+        if st == "exists":
+            ws.range((r, val_col_excel)).color = COLOR_GREEN
+        elif st == "does not exist":
+            ws.range((r, val_col_excel)).color = COLOR_RED
+        else:
+            ws.range((r, val_col_excel)).color = None
+        _apply_borders_like_left(ws, r, val_col_excel)
+
+
+def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[str]) -> int:
+    """
+    Place as many 'names_to_place' as possible into existing blank-Name rows (fillable rows).
+    Returns the count of names consumed from names_to_place.
+    """
+    consumed = 0
+    val_col_excel = plan["validation_col"] + 1
+    name_col_excel = plan["name_col"] + 1
+    no_col_excel   = plan["no_col"] + 1 if plan["no_col"] is not None else None
+    check_col_excel= plan["check_col"] + 1 if plan["check_col"] is not None else None
+
+    next_no = plan["next_no"]
+
+    for rel in plan["fillable_rel"]:
+        if consumed >= len(names_to_place):
+            break
+        r = plan["section_first_excel_row"] + rel
+
+        # Write Name
+        nm = names_to_place[consumed]
+        ws.range((r, name_col_excel)).value = nm
+
+        # Validation formatting/text
+        paste_formats_like_left(ws, r, val_col_excel)
+        ws.range((r, val_col_excel)).value = "Newly added"
+        ws.range((r, val_col_excel)).color = COLOR_ORANGE
+        _apply_borders_like_left(ws, r, val_col_excel)
+
+        # No.: if blank, assign next_no; if already has a number, keep it and bump the cursor if needed
+        if no_col_excel is not None:
+            raw = str(ws.range((r, no_col_excel)).value or "").strip()
+            cur = _extract_int(raw)
+            if cur is None and next_no is not None:
+                ws.range((r, no_col_excel)).value = next_no
+                next_no += 1
+            elif cur is not None and next_no is not None:
+                next_no = max(next_no, cur + 1)
+
+        # Check: clear fill only, keep borders
+        if check_col_excel is not None:
+            clear_fill_preserve_borders(ws, r, check_col_excel)
+
+        consumed += 1
+
+    # Update next_no back in plan for subsequent inserts
+    plan["next_no"] = next_no
+    return consumed
+
+
+def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str]) -> int:
+    """
+    Insert rows after the last real row and place remaining names there.
+    Returns the number of rows inserted.
+    """
+    if not remaining:
+        return 0
+
+    val_col_excel   = plan["validation_col"] + 1
+    name_col_excel  = plan["name_col"] + 1
+    no_col_excel    = plan["no_col"] + 1 if plan["no_col"] is not None else None
+    check_col_excel = plan["check_col"] + 1 if plan["check_col"] is not None else None
+
+    next_no = plan["next_no"]
+
+    for i, nm in enumerate(remaining):
+        r = plan["insert_at_excel_row"] + i
+        insert_row_with_style(ws, r)
+        ws.range((r, name_col_excel)).value = nm
+
+        paste_formats_like_left(ws, r, val_col_excel)
+        ws.range((r, val_col_excel)).value = "Newly added"
+        ws.range((r, val_col_excel)).color = COLOR_ORANGE
+        _apply_borders_like_left(ws, r, val_col_excel)
+
+        if no_col_excel is not None and next_no is not None:
+            ws.range((r, no_col_excel)).value = next_no
+            next_no += 1
+
+        if check_col_excel is not None:
+            clear_fill_preserve_borders(ws, r, check_col_excel)
+
+    plan["next_no"] = next_no
+    return len(remaining)
+
+
 def validate_and_write_both(
     excel_path: str,
     sheet_arg,
@@ -504,7 +640,7 @@ def validate_and_write_both(
     - Read sheet into DataFrame to compute plans for A and B
     - Duplicate the sheet safely and rename to '<orig>_validated'
     - Write Validation cells (format like left, then color + TEXT)
-    - Insert new rows and fill Name/No./Validation as needed
+    - Fill existing blank rows first; then insert new rows for any remaining names
     - Preserve objects/placement and autofit Validation column
     """
     # Read once for planning
@@ -533,7 +669,7 @@ def validate_and_write_both(
         wb = app.books.open(str(excel_path))
         src_sht = _sheet_by_name_or_index(wb, sheet_arg)
 
-        # Safe copy/rename (avoid stray '(2)' sheet; disable events to dodge macros)
+        # Safe copy/rename
         try:
             app.api.EnableEvents = False
         except Exception:
@@ -551,55 +687,30 @@ def validate_and_write_both(
             print(f"⚠️ Rename failed ({e}); keeping '{ws.name}'")
 
         placements = snapshot_and_set_placement(ws)
+
         rows_inserted_A = 0
 
         # ----- Section A: Process -----
         if plan_A is not None:
-            print("▶ Processing section A: Process")
+            print("▶ Processing section A (Process)")
             val_col_excel = plan_A["validation_col"] + 1
 
-            # Header: paste formats like left, set caption, clone borders from left
+            # Header: copy formats like left, set caption, borders like left
             paste_formats_like_left(ws, plan_A["header_excel_row"], val_col_excel)
             ws.range((plan_A["header_excel_row"], val_col_excel)).value = "Validation"
             _apply_borders_like_left(ws, plan_A["header_excel_row"], val_col_excel)
 
-            # Existing rows: format like left then color + TEXT
-            if plan_A["section_row_count"] > 0:
-                for i, status in enumerate(plan_A["validation_vals"]):
-                    r = plan_A["section_first_excel_row"] + i
-                    paste_formats_like_left(ws, r, val_col_excel)
-                    if status:
-                        ws.range((r, val_col_excel)).value = status  # <-- write the words
-                    else:
-                        ws.range((r, val_col_excel)).value = ""
-                    # color
-                    st = (status or "").lower()
-                    if st == "exists":
-                        ws.range((r, val_col_excel)).color = COLOR_GREEN
-                    elif st == "does not exist":
-                        ws.range((r, val_col_excel)).color = COLOR_RED
-                    else:
-                        ws.range((r, val_col_excel)).color = None
-                    _apply_borders_like_left(ws, r, val_col_excel)
+            # Existing rows' validation
+            _write_existing_validation(ws, plan_A)
 
-            # New rows: insert after last real row, keep styles/objects shifting
-            if plan_A["missing"]:
-                next_no = plan_A["next_no"]
-                for i, name in enumerate(plan_A["missing"]):
-                    r = plan_A["insert_at_excel_row"] + i
-                    insert_row_with_style(ws, r)
-                    ws.range((r, plan_A["name_col"] + 1)).value = name
-                    paste_formats_like_left(ws, r, val_col_excel)
-                    ws.range((r, val_col_excel)).value = "Newly added"
-                    ws.range((r, val_col_excel)).color = COLOR_ORANGE
-                    _apply_borders_like_left(ws, r, val_col_excel)
-                    if plan_A["no_col"] is not None and next_no is not None:
-                        ws.range((r, plan_A["no_col"] + 1)).value = next_no
-                        next_no += 1
-                    if plan_A["check_col"] is not None:
-                        clear_fill_preserve_borders(ws, r, plan_A["check_col"] + 1)
-                rows_inserted_A = len(plan_A["missing"])
+            # Fill blanks first
+            consumed = _fill_into_existing_blanks(ws, plan_A, plan_A["missing"])
+            remaining = plan_A["missing"][consumed:]
 
+            # Insert remaining at the bottom of the section
+            rows_inserted_A = _insert_new_rows(ws, plan_A, remaining)
+
+            # AutoFit Validation column
             try:
                 ws.api.Columns(val_col_excel).AutoFit()
             except Exception:
@@ -607,7 +718,7 @@ def validate_and_write_both(
 
         # ----- Section B: Business Object -----
         if plan_B is not None:
-            print("▶ Processing section B: Business Object")
+            print("▶ Processing section B (Business Object)")
             if plan_A is not None and plan_B["header_row_idx"] > plan_A["header_row_idx"]:
                 plan_B = apply_row_offset(plan_B, rows_inserted_A)
 
@@ -617,38 +728,11 @@ def validate_and_write_both(
             ws.range((plan_B["header_excel_row"], val_col_excel)).value = "Validation"
             _apply_borders_like_left(ws, plan_B["header_excel_row"], val_col_excel)
 
-            if plan_B["section_row_count"] > 0:
-                for i, status in enumerate(plan_B["validation_vals"]):
-                    r = plan_B["section_first_excel_row"] + i
-                    paste_formats_like_left(ws, r, val_col_excel)
-                    if status:
-                        ws.range((r, val_col_excel)).value = status  # <-- write the words
-                    else:
-                        ws.range((r, val_col_excel)).value = ""
-                    st = (status or "").lower()
-                    if st == "exists":
-                        ws.range((r, val_col_excel)).color = COLOR_GREEN
-                    elif st == "does not exist":
-                        ws.range((r, val_col_excel)).color = COLOR_RED
-                    else:
-                        ws.range((r, val_col_excel)).color = None
-                    _apply_borders_like_left(ws, r, val_col_excel)
+            _write_existing_validation(ws, plan_B)
 
-            if plan_B["missing"]:
-                next_no = plan_B["next_no"]
-                for i, name in enumerate(plan_B["missing"]):
-                    r = plan_B["insert_at_excel_row"] + i
-                    insert_row_with_style(ws, r)
-                    ws.range((r, plan_B["name_col"] + 1)).value = name
-                    paste_formats_like_left(ws, r, val_col_excel)
-                    ws.range((r, val_col_excel)).value = "Newly added"
-                    ws.range((r, val_col_excel)).color = COLOR_ORANGE
-                    _apply_borders_like_left(ws, r, val_col_excel)
-                    if plan_B["no_col"] is not None and next_no is not None:
-                        ws.range((r, plan_B["no_col"] + 1)).value = next_no
-                        next_no += 1
-                    if plan_B["check_col"] is not None:
-                        clear_fill_preserve_borders(ws, r, plan_B["check_col"] + 1)
+            consumed = _fill_into_existing_blanks(ws, plan_B, plan_B["missing"])
+            remaining = plan_B["missing"][consumed:]
+            _insert_new_rows(ws, plan_B, remaining)
 
             try:
                 ws.api.Columns(val_col_excel).AutoFit()
@@ -657,7 +741,7 @@ def validate_and_write_both(
 
         restore_placement(ws, placements)
         wb.save()
-        print(f"✅ Completed. Validation texts restored; sections trimmed to last real row; wrote '{ws.name}'.")
+        print(f"✅ Completed. Filled blank rows first, then inserted as needed. Wrote '{ws.name}'.")
     finally:
         try:
             app.api.EnableEvents = True
@@ -675,7 +759,7 @@ def validate_and_write_both(
 def main():
     parser = argparse.ArgumentParser(
         description="Validate 'A. Process' and 'B. Business Object' against <process name> / <object name> in a Blue Prism release XML. "
-                    "Preserves styling/objects and adds a colored 'Validation' column."
+                    "Fills blank rows first; preserves styling/objects; adds colored 'Validation'."
     )
     parser.add_argument('--xml', required=True, help="Path to Blue Prism .bprelease XML")
     parser.add_argument('--excel', required=True, help="Path to Excel file (.xlsx/.xlsm)")
