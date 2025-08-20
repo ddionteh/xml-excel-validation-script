@@ -2,15 +2,14 @@
 """
 Validate names in Excel 'A. Process' and 'B. Business Object' against a Blue Prism release XML.
 
-- Duplicates the target sheet (Excel-level copy, preserves shapes/objects/formatting)
-- Appends a 'Validation' column at the end of the section header
-- Colors 'Validation' cells: Exists=green, Does not exist=red, Newly added=orange
-- Inserts new rows (for XML names missing in Excel) so that objects and formatting shift correctly
-- Continues 'No.' numbering for newly inserted rows
-- Clears only the fill (not borders) in 'Check' for new rows
-- Stops B section at headers for C/D/E (supports 1-row or 2-row headers)
-
-Requires: pandas, openpyxl, xlwings
+Key points:
+- Duplicates the target sheet (Excel-level copy; preserves shapes/objects/formatting)
+- Adds a 'Validation' column at the end of the section header
+- Writes text + color: Exists=green, Does not exist=red, Newly added=orange
+- Inserts new rows for XML-only names (objects move with cells; borders kept)
+- Continues 'No.' numbering for inserted rows
+- Clears only the fill (not borders) in 'Check' for inserted rows
+- Section B stops at C/D/E; section ends trimmed to the last numbered/real row
 """
 
 import argparse
@@ -32,31 +31,17 @@ def _local(tag: str) -> str:
 def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
     """
     Extract an order-preserving unique list of names from the Blue Prism release XML.
-
-    Parameters
-    ----------
-    xml_path : str
-        Path to the .bprelease.xml file.
-    want : str
-        The element local name to extract ('process' or 'object').
-
-    Returns
-    -------
-    List[str]
-        Unique names in original encounter order.
+    - want: 'process' or 'object'
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()
     names: List[str] = []
-
     for elem in root.iter():
         if _local(elem.tag) == want:
             name_attr = elem.attrib.get('name')
             if name_attr:
                 names.append(name_attr.strip())
-
-    # order-preserving unique
-    return list(dict.fromkeys(names))
+    return list(dict.fromkeys(names))  # order-preserving unique
 
 
 # =============== DataFrame parsing helpers ===============
@@ -74,10 +59,8 @@ def _row_contains_all(row_series: pd.Series, keywords: List[str]) -> bool:
     """
     row = [_norm_cell(c) for c in row_series]
     keys = [_norm_cell(k) for k in keywords]
-    # spread across row
     if all(any(k in c for c in row) for k in keys):
         return True
-    # all together in one cell
     return any(all(k in c for k in keys) for c in row)
 
 
@@ -85,7 +68,7 @@ def _two_line_or_same_row_match(df: pd.DataFrame, i: int, group: List[str]) -> b
     """
     True if row i contains all tokens in 'group' (same row), OR
     row i contains the first token and row i+1 contains the remaining tokens.
-    This handles headers split across two lines (e.g., 'C.' then 'Environment Variables').
+    Handles headers split across two lines (e.g., 'C.' then 'Environment Variables').
     """
     if _row_contains_all(df.iloc[i], group):
         return True
@@ -111,18 +94,11 @@ def find_section(
     next_section_groups: Optional[List[List[str]]] = None,
 ):
     """
-    Locate a section and its boundaries.
-
-    A section is:
-      - a marker row containing all 'section_keywords' (e.g., ['A.', 'Process']),
-      - followed (within ~5 rows) by a header row containing 'header_keyword' (e.g., 'name'),
-      - content rows are everything after the header until the first row that matches one of
-        'next_section_groups' (each group is a list of tokens) or the end of the sheet.
-
-    Returns
-    -------
-    (content_start, content_end_exclusive, name_col_index, header_row_index, next_section_row_index)
-      - If not found, returns (None, None, None, None, None).
+    Locate a section and its coarse boundaries (will be trimmed later):
+      - marker row contains all 'section_keywords' (['A.', 'Process'] or ['B.', 'Business Object'])
+      - header row within ~5 rows contains 'header_keyword' ('name')
+      - content rows end at first row matching one of 'next_section_groups' or EOF
+    Returns (content_start, content_end_exclusive, name_col_index, header_row_index, next_section_row_index)
     """
     # 1) section start marker row
     section_start_idx = None
@@ -157,7 +133,7 @@ def find_section(
         print(f"❌ Could not identify the '{header_keyword}' column in the header row.")
         return None, None, None, None, None
 
-    # 4) section end (next header or EOF) — supports 1-row or 2-row headers via 'next_section_groups'
+    # 4) coarse section end (next header or EOF) — supports 1-row or 2-row headers
     next_section_row_idx = None
     content_end = None
     if next_section_groups:
@@ -171,7 +147,7 @@ def find_section(
 
     print(
         f"🔎 Section found: header at row {header_row_idx}, "
-        f"content rows {content_start}..{content_end - 1}, "
+        f"coarse content rows {content_start}..{content_end - 1}, "
         f"Name col = {name_col_index}"
     )
     return content_start, content_end, name_col_index, header_row_idx, next_section_row_idx
@@ -208,42 +184,23 @@ def snapshot_and_set_placement(ws) -> List[tuple]:
     Returns a list of (name, collection_type, original_placement) to restore later.
     """
     records: List[tuple] = []
-    # Shapes
-    try:
-        shp = ws.api.Shapes
-        for i in range(1, shp.Count + 1):
-            it = shp.Item(i)
+    for getter, coll_name in (
+        (lambda: ws.api.Shapes, "Shapes"),
+        (lambda: ws.api.ChartObjects(), "ChartObjects"),
+        (lambda: ws.api.OLEObjects(), "OLEObjects"),
+    ):
+        try:
+            coll = getter()
+            count = coll.Count
+        except Exception:
+            count = 0
+        for i in range(1, count + 1):
+            it = coll.Item(i)
             try:
-                records.append((it.Name, "Shapes", it.Placement))
-                it.Placement = 2
+                records.append((it.Name, coll_name, it.Placement))
+                it.Placement = 2  # xlMove
             except Exception:
                 pass
-    except Exception:
-        pass
-    # Charts
-    try:
-        ch = ws.api.ChartObjects()
-        for i in range(1, ch.Count + 1):
-            it = ch.Item(i)
-            try:
-                records.append((it.Name, "ChartObjects", it.Placement))
-                it.Placement = 2
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # OLE
-    try:
-        ole = ws.api.OLEObjects()
-        for i in range(1, ole.Count + 1):
-            it = ole.Item(i)
-            try:
-                records.append((it.Name, "OLEObjects", it.Placement))
-                it.Placement = 2
-            except Exception:
-                pass
-    except Exception:
-        pass
     return records
 
 
@@ -373,17 +330,18 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
     """
     Build a plan describing how to write Validation and where to insert new rows.
 
-    next_section_groups: list of keyword groups that signal the *next* header (stop point).
-                         Each group is a list of tokens that must appear on one row or
-                         split across two adjacent rows.
+    IMPORTANT TRIM: after coarse end is found, we trim the section to the **last real row**:
+      1) Prefer the last row whose 'No.' column contains a number;
+      2) Else, the last row with any non-blank cell in the row;
+      3) Else, fall back to the last row with a non-blank Name.
     """
     found = find_section(df, section_keys, header_keyword=header_keyword, next_section_groups=next_section_groups)
-    content_start, content_end, name_col, header_row_idx, _ = found
+    content_start, content_end_coarse, name_col, header_row_idx, _ = found
     if content_start is None:
         return None
 
-    # Decide Validation column position (reuse existing 'Validation' if present, else append)
     header_row = df.iloc[header_row_idx]
+    # Determine where to place 'Validation' (reuse if already present)
     validation_col = None
     for col_idx, val in header_row.items():
         if _norm_cell(val) == "validation":
@@ -392,40 +350,79 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
     if validation_col is None:
         validation_col = _last_nonempty_col_index(header_row) + 1
 
-    # Possibly present helper columns
+    # Identify helper columns
     no_col    = find_no_col_in_header(df, header_row_idx)
     check_col = find_check_col_in_header(df, header_row_idx)
 
-    # Names to validate (current section)
-    section_df  = df.iloc[content_start:content_end].copy().reset_index(drop=True)
+    # Slice the coarse section for trimming
+    coarse_df = df.iloc[content_start:content_end_coarse].copy().reset_index(drop=True)
+
+    # (A) last row with a numeric "No."
+    last_rel_by_no = None
+    if no_col is not None and no_col < coarse_df.shape[1]:
+        for i in range(len(coarse_df) - 1, -1, -1):
+            val = _extract_int(coarse_df.iat[i, no_col])
+            if val is not None:
+                last_rel_by_no = i
+                break
+
+    # (B) last row with any non-blank cell
+    last_rel_by_any = None
+    for i in range(len(coarse_df) - 1, -1, -1):
+        row_vals = [str(v).strip() for v in list(coarse_df.iloc[i].values)]
+        if any(v != "" for v in row_vals):
+            last_rel_by_any = i
+            break
+
+    # (C) last row with a non-blank Name
+    last_rel_by_name = None
+    if name_col is not None and name_col < coarse_df.shape[1]:
+        for i in range(len(coarse_df) - 1, -1, -1):
+            if str(coarse_df.iat[i, name_col]).strip() != "":
+                last_rel_by_name = i
+                break
+
+    # Decide true last row (relative)
+    if last_rel_by_no is not None:
+        last_rel = last_rel_by_no
+    elif last_rel_by_any is not None:
+        last_rel = last_rel_by_any
+    else:
+        last_rel = last_rel_by_name if last_rel_by_name is not None else -1
+
+    true_end_rel_exclusive = last_rel + 1 if last_rel >= 0 else 0
+    true_end_abs_exclusive = content_start + true_end_rel_exclusive  # 0-based exclusive
+
+    # Build section slice trimmed to the last real row
+    section_df = df.iloc[content_start:true_end_abs_exclusive].copy().reset_index(drop=True)
+
+    # Names and validation statuses for the trimmed region
     name_series = section_df[name_col].astype(str).fillna("").str.strip()
     excel_names = name_series.tolist()
+    xml_set     = {x.strip() for x in xml_names}
 
-    xml_set = {x.strip() for x in xml_names}
     validation_vals = []
     for nm in excel_names:
         if not nm:
-            validation_vals.append("")            # leave blank rows uncolored
+            validation_vals.append("")         # keep truly empty Name rows unlabelled
         elif nm in xml_set:
             validation_vals.append("Exists")
         else:
             validation_vals.append("Does not exist")
 
+    # Missing names to append
     excel_set = {n for n in excel_names if n}
     missing   = [n for n in xml_names if n not in excel_set]
 
-    # Find the last non-empty Name row (absolute index) to insert after
-    last_rel = None
-    for idx in range(len(name_series) - 1, -1, -1):
-        if name_series.iloc[idx] != "":
-            last_rel = idx
-            break
-    last_abs = header_row_idx if last_rel is None else content_start + last_rel
+    # Insert position: AFTER the last real row we just computed
+    last_abs = content_start + (true_end_rel_exclusive - 1) if true_end_rel_exclusive > 0 else header_row_idx
+    insert_after_abs = last_abs
+    insert_at_excel_row = insert_after_abs + 2  # Excel is 1-based; +1 to move after; +1 for 1-based
 
     # Next value for No.
     next_no = None
-    if no_col is not None and last_rel is not None:
-        parsed = _extract_int(section_df.iloc[last_rel, no_col])
+    if no_col is not None and true_end_rel_exclusive > 0:
+        parsed = _extract_int(section_df.iat[true_end_rel_exclusive - 1, no_col])
         if parsed is not None:
             next_no = parsed + 1
         else:
@@ -437,15 +434,15 @@ def plan_section(df: pd.DataFrame, section_keys: List[str], xml_names: List[str]
         "label": label,
         "header_row_idx": header_row_idx,
         "content_start": content_start,
-        "content_end": content_end,
+        "content_end": true_end_abs_exclusive,     # TRIMMED end (exclusive)
         "name_col": name_col,
         "validation_col": validation_col,
         "no_col": no_col,
         "check_col": check_col,
         "header_excel_row": header_row_idx + 1,
         "section_first_excel_row": content_start + 1,
-        "section_row_count": content_end - content_start,
-        "insert_at_excel_row": last_abs + 2,  # insert AFTER last populated Name row
+        "section_row_count": true_end_abs_exclusive - content_start,
+        "insert_at_excel_row": insert_at_excel_row,
         "excel_names": excel_names,
         "validation_vals": validation_vals,
         "missing": missing,
@@ -506,7 +503,7 @@ def validate_and_write_both(
     End-to-end:
     - Read sheet into DataFrame to compute plans for A and B
     - Duplicate the sheet safely and rename to '<orig>_validated'
-    - Write Validation cells (format like left, then color status)
+    - Write Validation cells (format like left, then color + TEXT)
     - Insert new rows and fill Name/No./Validation as needed
     - Preserve objects/placement and autofit Validation column
     """
@@ -554,7 +551,6 @@ def validate_and_write_both(
             print(f"⚠️ Rename failed ({e}); keeping '{ws.name}'")
 
         placements = snapshot_and_set_placement(ws)
-
         rows_inserted_A = 0
 
         # ----- Section A: Process -----
@@ -567,20 +563,26 @@ def validate_and_write_both(
             ws.range((plan_A["header_excel_row"], val_col_excel)).value = "Validation"
             _apply_borders_like_left(ws, plan_A["header_excel_row"], val_col_excel)
 
-            # Existing rows: format like left then color
+            # Existing rows: format like left then color + TEXT
             if plan_A["section_row_count"] > 0:
                 for i, status in enumerate(plan_A["validation_vals"]):
                     r = plan_A["section_first_excel_row"] + i
                     paste_formats_like_left(ws, r, val_col_excel)
-                    if not status:
-                        ws.range((r, val_col_excel)).color = None
-                    elif status.lower() == "exists":
+                    if status:
+                        ws.range((r, val_col_excel)).value = status  # <-- write the words
+                    else:
+                        ws.range((r, val_col_excel)).value = ""
+                    # color
+                    st = (status or "").lower()
+                    if st == "exists":
                         ws.range((r, val_col_excel)).color = COLOR_GREEN
-                    elif status.lower() == "does not exist":
+                    elif st == "does not exist":
                         ws.range((r, val_col_excel)).color = COLOR_RED
+                    else:
+                        ws.range((r, val_col_excel)).color = None
                     _apply_borders_like_left(ws, r, val_col_excel)
 
-            # New rows: insert after last populated Name row, keep styles/objects shifting
+            # New rows: insert after last real row, keep styles/objects shifting
             if plan_A["missing"]:
                 next_no = plan_A["next_no"]
                 for i, name in enumerate(plan_A["missing"]):
@@ -598,7 +600,6 @@ def validate_and_write_both(
                         clear_fill_preserve_borders(ws, r, plan_A["check_col"] + 1)
                 rows_inserted_A = len(plan_A["missing"])
 
-            # AutoFit Validation column
             try:
                 ws.api.Columns(val_col_excel).AutoFit()
             except Exception:
@@ -607,7 +608,6 @@ def validate_and_write_both(
         # ----- Section B: Business Object -----
         if plan_B is not None:
             print("▶ Processing section B: Business Object")
-            # If we inserted rows in A above B, shift B's Excel row indices
             if plan_A is not None and plan_B["header_row_idx"] > plan_A["header_row_idx"]:
                 plan_B = apply_row_offset(plan_B, rows_inserted_A)
 
@@ -621,12 +621,17 @@ def validate_and_write_both(
                 for i, status in enumerate(plan_B["validation_vals"]):
                     r = plan_B["section_first_excel_row"] + i
                     paste_formats_like_left(ws, r, val_col_excel)
-                    if not status:
-                        ws.range((r, val_col_excel)).color = None
-                    elif status.lower() == "exists":
+                    if status:
+                        ws.range((r, val_col_excel)).value = status  # <-- write the words
+                    else:
+                        ws.range((r, val_col_excel)).value = ""
+                    st = (status or "").lower()
+                    if st == "exists":
                         ws.range((r, val_col_excel)).color = COLOR_GREEN
-                    elif status.lower() == "does not exist":
+                    elif st == "does not exist":
                         ws.range((r, val_col_excel)).color = COLOR_RED
+                    else:
+                        ws.range((r, val_col_excel)).color = None
                     _apply_borders_like_left(ws, r, val_col_excel)
 
             if plan_B["missing"]:
@@ -650,10 +655,9 @@ def validate_and_write_both(
             except Exception:
                 pass
 
-        # Restore placements and save
         restore_placement(ws, placements)
         wb.save()
-        print(f"✅ Completed. Row-style Validation; B stops at C/D/E; Check borders preserved. Wrote '{ws.name}'.")
+        print(f"✅ Completed. Validation texts restored; sections trimmed to last real row; wrote '{ws.name}'.")
     finally:
         try:
             app.api.EnableEvents = True
