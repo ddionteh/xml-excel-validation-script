@@ -12,28 +12,27 @@ import xlwings as xw
 def _local(tag: str) -> str:
     return tag.split('}', 1)[1] if tag.startswith('{') else tag
 
-
 def extract_names_from_xml(xml_path: str, want: str) -> list[str]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
     names: list[str] = []
-    
-    # Handle Blue Prism object references in resource elements
+
+    # 1) Direct elements, e.g. <process name="..."> or <object name="...">
+    for elem in root.iter():
+        if _local(elem.tag) == want:
+            name_attr = elem.attrib.get('name')
+            if name_attr:
+                names.append(name_attr.strip())
+
+    # 2) Blue Prism references like <resource object="...">
     if want == "object":
-        # Look for <resource object="..." /> elements
         for elem in root.iter():
-            if _local(elem.tag) == "resource" and elem.get('object'):
-                object_name = elem.get('object')
-                if object_name:
-                    names.append(object_name.strip())
-    else:
-        # Handle other tag types (process, etc.)
-        for elem in root.iter():
-            if _local(elem.tag) == want:
-                name_attr = elem.attrib.get('name')
-                if name_attr:
-                    names.append(name_attr.strip())
-    
+            if _local(elem.tag) == "resource":
+                obj = elem.get('object')
+                if obj:
+                    names.append(obj.strip())
+
+    # order-preserving unique
     return list(dict.fromkeys(names))
 
 
@@ -424,13 +423,32 @@ def validate_and_write_both(
         wb = app.books.open(str(excel_path))
         src_sht = _sheet_by_name_or_index(wb, sheet_arg)
 
+        # --- Harden copying: disable events, detect the added sheet by diff ---
+        try:
+            app.api.EnableEvents = False  # prevent Workbook_NewSheet or other macros
+        except Exception:
+            pass
+
+        before_names = [s.name for s in wb.sheets]
         src_sht.api.Copy(After=src_sht.api)
-        ws = wb.sheets[-1]
+        after_names = [s.name for s in wb.sheets]
+        added = [n for n in after_names if n not in before_names]
+
+        if len(added) != 1:
+            print("⚠️ Unexpected sheet-copy result. Before:", before_names)
+            print("⚠️ After:", after_names)
+            # Fallback to last sheet to avoid crashing
+            ws = wb.sheets[-1]
+        else:
+            ws = wb.sheets[added[0]]
+
+        # Rename deterministically to "<original>_validated" (unique)
         new_name = _unique_sheet_name(wb, f"{src_sht.name}_validated")
         try:
             ws.name = new_name
         except Exception as e:
             print(f"⚠️ Rename failed ({e}); keeping '{ws.name}'")
+
 
         placements = snapshot_and_set_placement(ws)
 
@@ -530,6 +548,10 @@ def validate_and_write_both(
         wb.save()
         print(f"✅ Completed. Wrote Validation (colored, autofit) & appended new rows in '{ws.name}'.")
     finally:
+        try:
+            app.api.EnableEvents = True
+        except Exception:
+            pass
         try:
             wb.close()
         except Exception:
