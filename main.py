@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-Validate names in Excel 'A. Process' and 'B. Business Object' against a Blue Prism release XML.
-Extended to handle:
-- 'S. Work Queues' (Work Queue Name + Key Name validation)
+Validate Excel sections against a Blue Prism release XML.
 
-Key behaviors (unchanged from your version):
-- Missing XML names first fill existing blank Name rows inside the section (even if 'No.' already has 4/5/etc),
-  then append new rows only if needed.
-- 'No.' numbering continues: if a fillable row has a blank No., it gets the next number; if it already has a number, we keep it.
-- Section ends are trimmed to the last real row (prefer 'No.' numeric; else any non-blank cell; else last non-blank Name).
-- Validation writes both TEXT ("Exists", "Does not exist", "Newly added") and color (green/red/orange).
-- Borders/formatting preserved; embedded objects set to "move with cells" during edits and restored after.
+Supports:
+- A. Process
+- B. Business Object
+- S. Work Queues (Work Queue Name + Key Name validation)
 
-New for 'S. Work Queues':
-- Extract work-queue (name + key-field) from XML.
-- Force the 'Name' column to be 'Work Queue Name' (or a header containing both 'work' and 'queue');
-  fallback to a header that has 'name' but NOT 'key'.
-- For 'Newly added' rows, also writes Key Name column (if present).
-- For existing rows marked 'Exists', validates Key Name and annotates mismatches.
-- Includes inserted rows in the key validation pass.
+Behaviors:
+- Fill existing blank Name rows first before inserting.
+- Continue numbering in 'No.' where needed.
+- Trim sections to the last real row.
+- Write Validation text + color (green/red/orange).
+- Preserve borders/formatting; set embedded objects to "move with cells" during edits and restore later.
 """
 
 import argparse
@@ -79,6 +73,18 @@ def _norm_cell(s) -> str:
     return str(s).strip().casefold()
 
 
+def _normalize_marker_token(s: str) -> str:
+    """
+    Lowercase + trim; if the token is a single letter with optional '.' or ':',
+    strip that trailing punctuation so 's' == 's.' == 's:'.
+    """
+    v = _norm_cell(s)
+    # Accept forms like 'a', 'a.', 'a:'
+    if re.fullmatch(r"[a-zA-Z][\.:]?", v or ""):
+        return v.rstrip(".:")
+    return v
+
+
 def _row_contains_all(row_series: pd.Series, keywords: List[str]) -> bool:
     """
     True if all keywords appear either spread across the row cells, or together in any one cell.
@@ -87,7 +93,17 @@ def _row_contains_all(row_series: pd.Series, keywords: List[str]) -> bool:
     keys = [_norm_cell(k) for k in keywords]
     if all(any(k in c for c in row) for k in keys):
         return True
-    # or all tokens in any single cell
+    return any(all(k in c for k in keys) for c in row)
+
+
+def _row_contains_all_markers(row_series: pd.Series, keywords: List[str]) -> bool:
+    """
+    Like _row_contains_all, but with dot/colon-insensitive matching for single-letter markers (A/A., S/S., etc.).
+    """
+    row = [_normalize_marker_token(c) for c in row_series]
+    keys = [_normalize_marker_token(k) for k in keywords]
+    if all(any(k in c for c in row) for k in keys):
+        return True
     return any(all(k in c for k in keys) for c in row)
 
 
@@ -100,6 +116,18 @@ def _two_line_or_same_row_match(df: pd.DataFrame, i: int, group: List[str]) -> b
         return True
     if len(group) >= 2 and i + 1 < len(df):
         if _row_contains_all(df.iloc[i], [group[0]]) and _row_contains_all(df.iloc[i + 1], group[1:]):
+            return True
+    return False
+
+
+def _two_line_or_same_row_match_markers(df: pd.DataFrame, i: int, group: List[str]) -> bool:
+    """
+    Marker-aware version (A/A., S/S., etc.).
+    """
+    if _row_contains_all_markers(df.iloc[i], group):
+        return True
+    if len(group) >= 2 and i + 1 < len(df):
+        if _row_contains_all_markers(df.iloc[i], [group[0]]) and _row_contains_all_markers(df.iloc[i + 1], group[1:]):
             return True
     return False
 
@@ -121,24 +149,24 @@ def find_section(
 ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
     """
     Locate a section and its coarse boundaries (will be trimmed later):
-      - marker row contains all 'section_keywords' (['A.', 'Process'] or ['S.', 'work', 'queue'])
-      - header row within ~5 rows contains 'header_keyword' ('name')
+      - marker row contains all 'section_keywords' (e.g., ['A.', 'Process'] or ['S.', 'work', 'queue'])
+      - header row within ~12 rows contains 'header_keyword' ('name' for A/B, 'queue' for S)
       - content rows end at first row matching one of 'next_section_groups' or EOF
     Returns (content_start, content_end_exclusive, name_col_index, header_row_index, next_section_row_index)
     """
-    # 1) section start marker row (S is in the same row; _row_contains_all is sufficient)
+    # 1) section start marker row (marker-aware to allow 'S' or 'S.')
     section_start_idx = None
     for i in range(len(df) - 1):
-        if _row_contains_all(df.iloc[i], section_keywords):
+        if _row_contains_all_markers(df.iloc[i], section_keywords):
             section_start_idx = i
             break
     if section_start_idx is None:
         print(f"❌ Could not find row containing all: {section_keywords}")
         return None, None, None, None, None
 
-    # 2) header row (within next ~5 rows)
+    # 2) header row (widened window: up to 12 rows)
     header_row_idx = None
-    scan_limit = min(section_start_idx + 6, len(df))
+    scan_limit = min(section_start_idx + 12, len(df))
     for j in range(section_start_idx + 1, scan_limit):
         if _row_contains_all(df.iloc[j], [header_keyword]):
             header_row_idx = j
@@ -149,7 +177,7 @@ def find_section(
 
     content_start = header_row_idx + 1
 
-    # 3) detect Name column from header row (generic, may be overridden by S-specific logic)
+    # 3) detect Name column from header row (generic; S will override below in plan_section)
     name_col_index = None
     for col_idx, val in df.iloc[header_row_idx].items():
         if header_keyword in _norm_cell(val):
@@ -159,12 +187,12 @@ def find_section(
         print(f"❌ Could not identify the '{header_keyword}' column in the header row.")
         return None, None, None, None, None
 
-    # 4) coarse section end (next header or EOF) — supports 1-row or 2-row headers
+    # 4) coarse section end (next header or EOF)
     next_section_row_idx = None
     content_end = None
     if next_section_groups:
         for k in range(content_start, len(df)):
-            if any(_two_line_or_same_row_match(df, k, grp) for grp in next_section_groups):
+            if any(_two_line_or_same_row_match_markers(df, k, grp) for grp in next_section_groups):
                 next_section_row_idx = k
                 content_end = k
                 break
@@ -216,17 +244,14 @@ def _find_wq_name_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Option
         v = _norm_cell(val)
         candidates.append((col_idx, v))
 
-    # 1) 'work' & 'queue'
     for col_idx, v in candidates:
         if ("work" in v) and ("queue" in v):
             return col_idx
 
-    # 2) 'name' but not 'key'
     for col_idx, v in candidates:
         if ("name" in v) and ("key" not in v):
             return col_idx
 
-    # 3) any 'name'
     for col_idx, v in candidates:
         if "name" in v:
             return col_idx
@@ -517,7 +542,7 @@ def plan_section(
         if nm != "":
             continue
         row = section_df.iloc[i]
-        has_no_num = (_extract_int(row[name_col*0 + no_col]) is not None) if (no_col is not None and no_col < len(row)) else False
+        has_no_num = (_extract_int(row[no_col]) is not None) if (no_col is not None and no_col < len(row)) else False
         has_other  = any((str(row[j]).strip() != "" and j != name_col) for j in range(len(row)))
         if has_no_num or has_other:
             fillable_rel.append(i)
@@ -552,7 +577,7 @@ def plan_section(
         "validation_vals": validation_vals,
         "missing": missing,
         "next_no": next_no,
-        "fillable_rel": fillable_rel,  # relative indices (0..section_row_count-1)
+        "fillable_rel": fillable_rel,               # relative indices (0..section_row_count-1)
         "inserted_rows": 0,
     }
 
@@ -607,10 +632,7 @@ def _write_existing_validation(ws, plan: Dict[str, Any]) -> None:
     for i, status in enumerate(plan["validation_vals"]):
         r = start_row + i
         paste_formats_like_left(ws, r, val_col_excel)
-        if status:
-            ws.range((r, val_col_excel)).value = status
-        else:
-            ws.range((r, val_col_excel)).value = ""
+        ws.range((r, val_col_excel)).value = status if status else ""
         st = (status or "").lower()
         if st == "exists":
             ws.range((r, val_col_excel)).color = COLOR_GREEN
@@ -621,7 +643,8 @@ def _write_existing_validation(ws, plan: Dict[str, Any]) -> None:
         _apply_borders_like_left(ws, r, val_col_excel)
 
 
-def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[str], xml_wq: Optional[Dict[str, Dict[str, Optional[str]]]] = None) -> int:
+def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[str],
+                               xml_wq: Optional[Dict[str, Dict[str, Optional[str]]]] = None) -> int:
     """
     Place as many 'names_to_place' as possible into existing blank-Name rows (fillable rows).
     For S. Work Queues, also writes Key Name if column exists and XML has it.
@@ -678,7 +701,8 @@ def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[st
     return consumed
 
 
-def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: Optional[Dict[str, Dict[str, Optional[str]]]] = None) -> int:
+def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str],
+                     xml_wq: Optional[Dict[str, Dict[str, Optional[str]]]] = None) -> int:
     """
     Insert rows after the last real row and place remaining names there.
     For S. Work Queues, also writes Key Name if column exists and XML has it.
@@ -759,7 +783,6 @@ def _adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[s
                 ws.range((r, val_col_excel)).value = f'Exists (Key mismatch: expected "{expected_key}")'
             elif current.lower().startswith("newly added"):
                 ws.range((r, val_col_excel)).value = f'Newly added (Key mismatch: expected "{expected_key}")'
-            # color attention
             ws.range((r, val_col_excel)).color = COLOR_ORANGE
 
 
@@ -768,7 +791,7 @@ def validate_and_write_both(
     sheet_arg,
     xml_process_names: List[str],
     xml_object_names: List[str],
-    xml_work_queues: Dict[str, Dict[str, Optional[str]]],  # NEW: name -> {'key': ...}
+    xml_work_queues: Dict[str, Dict[str, Optional[str]]],  # name -> {'key': ...}
 ) -> None:
     """
     End-to-end:
@@ -784,24 +807,27 @@ def validate_and_write_both(
     df = pd.read_excel(excel_path, sheet_name=sheet_arg_for_pd, header=None, dtype=str, engine='openpyxl').fillna('')
 
     # Define section boundaries:
-    # A ends at B; B ends at C/D/E (allow split headers); S likely near the end → until EOF
+    # A ends at B; B ends at C/D/E; S likely near the end → until EOF
     next_for_A = [["B.", "Business Object"]]
     next_for_B = [
-        ["C.", "Environment Variables"],  # tolerate exact text for backward compatibility
+        ["C.", "Environment Variables"],
+        ["C",  "Environment Variables"],
         ["C.", "environment", "variable"],
         ["D.", "environment", "variable"],
+        ["D",  "environment", "variable"],
         ["E.", "Startup Parameters"],
+        ["E",  "Startup Parameters"],
     ]
-    next_for_S = None  # let it run to EOF
+    next_for_S = None  # let it run to EOF (adjust if you have sections after S)
 
     plan_A = plan_section(df, ["A.", "Process"], xml_process_names, label="Process",
                           header_keyword="name", next_section_groups=next_for_A)
     plan_B = plan_section(df, ["B.", "Business Object"], xml_object_names, label="Business Object",
                           header_keyword="name", next_section_groups=next_for_B)
-    # NEW: Work Queues
+    # Work Queues — header_keyword='queue' (easier to find “Work Queue Name” rows)
     xml_wq_names = list(xml_work_queues.keys())
     plan_S = plan_section(df, ["S.", "work", "queue"], xml_wq_names, label="Work Queues",
-                          header_keyword="name", next_section_groups=next_for_S)
+                          header_keyword="queue", next_section_groups=next_for_S)
 
     if plan_A is None and plan_B is None and plan_S is None:
         print("⛔ Stopping: sections A, B, S were not detected.")
@@ -902,7 +928,7 @@ def validate_and_write_both(
             remaining = plan_S["missing"][consumed:]
             _insert_new_rows(ws, plan_S, remaining, xml_work_queues)
 
-            # Post-pass: for rows that 'Exists' or 'Newly added', verify Key Name vs XML (includes inserted rows)
+            # Post-pass: verify Key Name vs XML (includes inserted rows)
             _adjust_wq_key_validation(ws, plan_S, xml_work_queues)
 
             try:
@@ -940,7 +966,7 @@ def main():
     print("🔍 Parsing XML…")
     xml_process_names = extract_names_from_xml(args.xml, "process")
     xml_object_names  = extract_names_from_xml(args.xml, "object")
-    xml_work_queues   = extract_work_queues_from_xml(args.xml)  # NEW
+    xml_work_queues   = extract_work_queues_from_xml(args.xml)
     print(f"✅ Found {len(xml_process_names)} process names; {len(xml_object_names)} object names; "
           f"{len(xml_work_queues)} work queues.")
 
@@ -950,7 +976,7 @@ def main():
         sheet_arg=args.sheet,
         xml_process_names=xml_process_names,
         xml_object_names=xml_object_names,
-        xml_work_queues=xml_work_queues,  # NEW
+        xml_work_queues=xml_work_queues,
     )
 
 
