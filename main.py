@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
 Validate names in Excel 'A. Process' and 'B. Business Object' against a Blue Prism release XML.
+Extended to handle:
+- 'S. Work Queues' (Name + Key Name validation)
 
-Improvements in this version:
+Key behaviors (unchanged from your version):
 - Missing XML names first fill existing blank Name rows inside the section (even if 'No.' already has 4/5/etc),
   then append new rows only if needed.
 - 'No.' numbering continues: if a fillable row has a blank No., it gets the next number; if it already has a number, we keep it.
 - Section ends are trimmed to the last real row (prefer 'No.' numeric; else any non-blank cell; else last non-blank Name).
 - Validation writes both TEXT ("Exists", "Does not exist", "Newly added") and color (green/red/orange).
 - Borders/formatting preserved; embedded objects set to "move with cells" during edits and restored after.
+
+New for 'S. Work Queues':
+- Extract work-queue (name + key-field) from XML.
+- Section detection keyed on tokens ["S.", "work", "queue"] (singular/plural tolerant across split rows).
+- For 'Newly added' rows, also writes Key Name column (if present).
+- For existing rows marked 'Exists', validates Key Name and annotates mismatches.
 """
 
 import argparse
@@ -43,6 +51,23 @@ def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
     return list(dict.fromkeys(names))  # order-preserving unique
 
 
+def extract_work_queues_from_xml(xml_path: str) -> Dict[str, Dict[str, Optional[str]]]:
+    """
+    Extract work queues as a dict: { name: {'key': <key-field or ''>} }.
+    Blue Prism <work-queue ... name="…" key-field="…"> (no environment split).
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    wq: Dict[str, Dict[str, Optional[str]]] = {}
+    for elem in root.iter():
+        if _local(elem.tag) == "work-queue":
+            name = (elem.attrib.get("name") or "").strip()
+            key = (elem.attrib.get("key-field") or "").strip()
+            if name and name not in wq:
+                wq[name] = {"key": key}
+    return wq
+
+
 # =============== DataFrame parsing helpers ===============
 
 def _norm_cell(s) -> str:
@@ -60,6 +85,7 @@ def _row_contains_all(row_series: pd.Series, keywords: List[str]) -> bool:
     keys = [_norm_cell(k) for k in keywords]
     if all(any(k in c for c in row) for k in keys):
         return True
+    # or all tokens in any single cell
     return any(all(k in c for k in keys) for c in row)
 
 
@@ -67,7 +93,7 @@ def _two_line_or_same_row_match(df: pd.DataFrame, i: int, group: List[str]) -> b
     """
     True if row i contains all tokens in 'group' (same row), OR
     row i contains the first token and row i+1 contains the remaining tokens.
-    Handles headers split across two lines (e.g., 'C.' then 'Environment Variables').
+    Handles headers split across two lines (e.g., 'S.' then 'Work Queue(s)').
     """
     if _row_contains_all(df.iloc[i], group):
         return True
@@ -94,7 +120,7 @@ def find_section(
 ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
     """
     Locate a section and its coarse boundaries (will be trimmed later):
-      - marker row contains all 'section_keywords' (['A.', 'Process'] or ['B.', 'Business Object'])
+      - marker row contains all 'section_keywords' (['A.', 'Process'] or ['S.', 'work', 'queue'])
       - header row within ~5 rows contains 'header_keyword' ('name')
       - content rows end at first row matching one of 'next_section_groups' or EOF
     Returns (content_start, content_end_exclusive, name_col_index, header_row_index, next_section_row_index)
@@ -169,6 +195,15 @@ def find_check_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[
     return None
 
 
+def find_keyname_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
+    """Locate 'Key Name' column index (accepts 'Key Name' or cells containing both 'key' and 'name')."""
+    for col_idx, val in df.iloc[header_row_idx].items():
+        v = _norm_cell(val)
+        if "key name" in v or ("key" in v and "name" in v):
+            return col_idx
+    return None
+
+
 def _extract_int(s: str) -> Optional[int]:
     """Extract the first integer found in a string, or None."""
     m = re.search(r"\d+", str(s))
@@ -223,7 +258,7 @@ def restore_placement(ws, records: List[tuple]) -> None:
 
 COLOR_GREEN  = (198, 239, 206)  # Exists
 COLOR_RED    = (255, 199, 206)  # Does not exist
-COLOR_ORANGE = (255, 235, 156)  # Newly added
+COLOR_ORANGE = (255, 235, 156)  # Newly added / Key mismatch attention
 
 def _clone_borders(from_cell_api, to_cell_api) -> None:
     """Clone all border edges and alignment from 'from_cell_api' to 'to_cell_api'."""
@@ -370,6 +405,7 @@ def plan_section(
     # Helper columns
     no_col    = find_no_col_in_header(df, header_row_idx)
     check_col = find_check_col_in_header(df, header_row_idx)
+    key_col   = find_keyname_col_in_header(df, header_row_idx)  # may be None outside 'S'
 
     # Slice the coarse section for trimming
     coarse_df = df.iloc[content_start:content_end_coarse].copy().reset_index(drop=True)
@@ -468,6 +504,7 @@ def plan_section(
         "validation_col": validation_col,
         "no_col": no_col,
         "check_col": check_col,
+        "key_col": key_col,                         # may be None (only relevant for S)
         "header_excel_row": header_row_idx + 1,
         "section_first_excel_row": content_start + 1,
         "section_row_count": true_end_abs_exclusive - content_start,
@@ -544,9 +581,10 @@ def _write_existing_validation(ws, plan: Dict[str, Any]) -> None:
         _apply_borders_like_left(ws, r, val_col_excel)
 
 
-def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[str]) -> int:
+def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[str], xml_wq: Optional[Dict[str, Dict[str, Optional[str]]]] = None) -> int:
     """
     Place as many 'names_to_place' as possible into existing blank-Name rows (fillable rows).
+    For S. Work Queues, also writes Key Name if column exists and XML has it.
     Returns the count of names consumed from names_to_place.
     """
     consumed = 0
@@ -554,6 +592,7 @@ def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[st
     name_col_excel = plan["name_col"] + 1
     no_col_excel   = plan["no_col"] + 1 if plan["no_col"] is not None else None
     check_col_excel= plan["check_col"] + 1 if plan["check_col"] is not None else None
+    key_col_excel  = plan["key_col"] + 1 if plan.get("key_col") is not None else None
 
     next_no = plan["next_no"]
 
@@ -565,6 +604,12 @@ def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[st
         # Write Name
         nm = names_to_place[consumed]
         ws.range((r, name_col_excel)).value = nm
+
+        # If this is S. Work Queues, also write Key Name
+        if key_col_excel is not None and xml_wq is not None:
+            key_val = (xml_wq.get(nm, {}) or {}).get("key") or ""
+            if key_val:
+                ws.range((r, key_col_excel)).value = key_val
 
         # Validation formatting/text
         paste_formats_like_left(ws, r, val_col_excel)
@@ -593,9 +638,10 @@ def _fill_into_existing_blanks(ws, plan: Dict[str, Any], names_to_place: List[st
     return consumed
 
 
-def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str]) -> int:
+def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: Optional[Dict[str, Dict[str, Optional[str]]]] = None) -> int:
     """
     Insert rows after the last real row and place remaining names there.
+    For S. Work Queues, also writes Key Name if column exists and XML has it.
     Returns the number of rows inserted.
     """
     if not remaining:
@@ -605,6 +651,7 @@ def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str]) -> int:
     name_col_excel  = plan["name_col"] + 1
     no_col_excel    = plan["no_col"] + 1 if plan["no_col"] is not None else None
     check_col_excel = plan["check_col"] + 1 if plan["check_col"] is not None else None
+    key_col_excel   = plan["key_col"] + 1 if plan.get("key_col") is not None else None
 
     next_no = plan["next_no"]
 
@@ -612,6 +659,12 @@ def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str]) -> int:
         r = plan["insert_at_excel_row"] + i
         insert_row_with_style(ws, r)
         ws.range((r, name_col_excel)).value = nm
+
+        # If this is S. Work Queues, also write Key Name
+        if key_col_excel is not None and xml_wq is not None:
+            key_val = (xml_wq.get(nm, {}) or {}).get("key") or ""
+            if key_val:
+                ws.range((r, key_col_excel)).value = key_val
 
         paste_formats_like_left(ws, r, val_col_excel)
         ws.range((r, val_col_excel)).value = "Newly added"
@@ -629,18 +682,56 @@ def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str]) -> int:
     return len(remaining)
 
 
+def _adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> None:
+    """
+    For S. Work Queues:
+    - For rows with 'Exists' or 'Newly added', compare Excel 'Key Name' to XML 'key-field'.
+    - If mismatch, annotate validation text and set ORANGE; if match, keep existing color/text.
+    """
+    key_col = plan.get("key_col")
+    if key_col is None:
+        return
+
+    name_col_excel = plan["name_col"] + 1
+    key_col_excel  = key_col + 1
+    val_col_excel  = plan["validation_col"] + 1
+
+    for i in range(plan["section_row_count"]):
+        r = plan["section_first_excel_row"] + i
+        nm  = (ws.range((r, name_col_excel)).value or "").strip()
+        if not nm or nm not in xml_wq:
+            continue
+
+        expected_key = (xml_wq[nm].get("key") or "").strip()
+        if not expected_key:
+            continue  # nothing to compare
+
+        excel_key = (ws.range((r, key_col_excel)).value or "").strip()
+
+        if excel_key.strip().casefold() != expected_key.strip().casefold():
+            current = (ws.range((r, val_col_excel)).value or "").strip()
+            if current.lower().startswith("exists"):
+                ws.range((r, val_col_excel)).value = f'Exists (Key mismatch: expected "{expected_key}")'
+            elif current.lower().startswith("newly added"):
+                ws.range((r, val_col_excel)).value = f'Newly added (Key mismatch: expected "{expected_key}")'
+            # color attention
+            ws.range((r, val_col_excel)).color = COLOR_ORANGE
+
+
 def validate_and_write_both(
     excel_path: str,
     sheet_arg,
     xml_process_names: List[str],
     xml_object_names: List[str],
+    xml_work_queues: Dict[str, Dict[str, Optional[str]]],  # NEW: name -> {'key': ...}
 ) -> None:
     """
     End-to-end:
-    - Read sheet into DataFrame to compute plans for A and B
+    - Read sheet into DataFrame to compute plans for A, B, S
     - Duplicate the sheet safely and rename to '<orig>_validated'
     - Write Validation cells (format like left, then color + TEXT)
     - Fill existing blank rows first; then insert new rows for any remaining names
+    - For S: also fill 'Key Name' for newly added, and flag key mismatches
     - Preserve objects/placement and autofit Validation column
     """
     # Read once for planning
@@ -648,20 +739,27 @@ def validate_and_write_both(
     df = pd.read_excel(excel_path, sheet_name=sheet_arg_for_pd, header=None, dtype=str, engine='openpyxl').fillna('')
 
     # Define section boundaries:
-    # A ends at B; B ends at C/D/E (allow split headers)
+    # A ends at B; B ends at C/D/E (allow split headers); S likely near the end → until EOF
     next_for_A = [["B.", "Business Object"]]
     next_for_B = [
-        ["C.", "Environment Variables"],
-        ["D.", "Environment Variables"],
+        ["C.", "Environment Variables"],  # tolerate exact text for backward compatibility
+        ["C.", "environment", "variable"],
+        ["D.", "environment", "variable"],
         ["E.", "Startup Parameters"],
     ]
+    next_for_S = None  # let it run to EOF
 
     plan_A = plan_section(df, ["A.", "Process"], xml_process_names, label="Process",
                           header_keyword="name", next_section_groups=next_for_A)
     plan_B = plan_section(df, ["B.", "Business Object"], xml_object_names, label="Business Object",
                           header_keyword="name", next_section_groups=next_for_B)
-    if plan_A is None and plan_B is None:
-        print("⛔ Stopping: neither section A nor B was detected.")
+    # NEW: Work Queues
+    xml_wq_names = list(xml_work_queues.keys())
+    plan_S = plan_section(df, ["S.", "work", "queue"], xml_wq_names, label="Work Queues",
+                          header_keyword="name", next_section_groups=next_for_S)
+
+    if plan_A is None and plan_B is None and plan_S is None:
+        print("⛔ Stopping: sections A, B, S were not detected.")
         return
 
     app = xw.App(visible=False, add_book=False)
@@ -689,28 +787,24 @@ def validate_and_write_both(
         placements = snapshot_and_set_placement(ws)
 
         rows_inserted_A = 0
+        rows_inserted_B = 0
+        rows_inserted_S = 0
 
         # ----- Section A: Process -----
         if plan_A is not None:
             print("▶ Processing section A (Process)")
             val_col_excel = plan_A["validation_col"] + 1
 
-            # Header: copy formats like left, set caption, borders like left
             paste_formats_like_left(ws, plan_A["header_excel_row"], val_col_excel)
             ws.range((plan_A["header_excel_row"], val_col_excel)).value = "Validation"
             _apply_borders_like_left(ws, plan_A["header_excel_row"], val_col_excel)
 
-            # Existing rows' validation
             _write_existing_validation(ws, plan_A)
 
-            # Fill blanks first
             consumed = _fill_into_existing_blanks(ws, plan_A, plan_A["missing"])
             remaining = plan_A["missing"][consumed:]
-
-            # Insert remaining at the bottom of the section
             rows_inserted_A = _insert_new_rows(ws, plan_A, remaining)
 
-            # AutoFit Validation column
             try:
                 ws.api.Columns(val_col_excel).AutoFit()
             except Exception:
@@ -732,7 +826,40 @@ def validate_and_write_both(
 
             consumed = _fill_into_existing_blanks(ws, plan_B, plan_B["missing"])
             remaining = plan_B["missing"][consumed:]
-            _insert_new_rows(ws, plan_B, remaining)
+            rows_inserted_B = _insert_new_rows(ws, plan_B, remaining)
+
+            try:
+                ws.api.Columns(val_col_excel).AutoFit()
+            except Exception:
+                pass
+
+        # ----- Section S: Work Queues ----- NEW
+        if plan_S is not None:
+            print("▶ Processing section S (Work Queues)")
+            # account for rows inserted above
+            offset = 0
+            if plan_A is not None and plan_S["header_row_idx"] > plan_A["header_row_idx"]:
+                offset += rows_inserted_A
+            if plan_B is not None and plan_S["header_row_idx"] > plan_B["header_row_idx"]:
+                offset += rows_inserted_B
+            if offset:
+                plan_S = apply_row_offset(plan_S, offset)
+
+            val_col_excel = plan_S["validation_col"] + 1
+            paste_formats_like_left(ws, plan_S["header_excel_row"], val_col_excel)
+            ws.range((plan_S["header_excel_row"], val_col_excel)).value = "Validation"
+            _apply_borders_like_left(ws, plan_S["header_excel_row"], val_col_excel)
+
+            # Existing rows' validation (name-based)
+            _write_existing_validation(ws, plan_S)
+
+            # Fill blanks first (write Name + Key if available), then insert remaining
+            consumed = _fill_into_existing_blanks(ws, plan_S, plan_S["missing"], xml_work_queues)
+            remaining = plan_S["missing"][consumed:]
+            rows_inserted_S = _insert_new_rows(ws, plan_S, remaining, xml_work_queues)
+
+            # Post-pass: for rows that 'Exists' or 'Newly added', verify Key Name vs XML
+            _adjust_wq_key_validation(ws, plan_S, xml_work_queues)
 
             try:
                 ws.api.Columns(val_col_excel).AutoFit()
@@ -758,7 +885,7 @@ def validate_and_write_both(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate 'A. Process' and 'B. Business Object' against <process name> / <object name> in a Blue Prism release XML. "
+        description="Validate 'A. Process', 'B. Business Object', and 'S. Work Queues' against a Blue Prism release XML. "
                     "Fills blank rows first; preserves styling/objects; adds colored 'Validation'."
     )
     parser.add_argument('--xml', required=True, help="Path to Blue Prism .bprelease XML")
@@ -769,7 +896,9 @@ def main():
     print("🔍 Parsing XML…")
     xml_process_names = extract_names_from_xml(args.xml, "process")
     xml_object_names  = extract_names_from_xml(args.xml, "object")
-    print(f"✅ Found {len(xml_process_names)} process names; {len(xml_object_names)} object names.")
+    xml_work_queues   = extract_work_queues_from_xml(args.xml)  # NEW
+    print(f"✅ Found {len(xml_process_names)} process names; {len(xml_object_names)} object names; "
+          f"{len(xml_work_queues)} work queues.")
 
     print("🧪 Validating & writing…")
     validate_and_write_both(
@@ -777,6 +906,7 @@ def main():
         sheet_arg=args.sheet,
         xml_process_names=xml_process_names,
         xml_object_names=xml_object_names,
+        xml_work_queues=xml_work_queues,  # NEW
     )
 
 
