@@ -8,17 +8,17 @@ Supports:
 - S. Work Queues (Work Queue Name + Key Name validation)
 
 Behavior preserved from your original:
-- Fill existing blank Name rows first, then insert any remaining.
+- Fill existing blank Name rows first, then insert remaining.
 - Continue 'No.' numbering.
 - Trim sections to the last real row.
 - Write Validation text + color (green/red/orange).
 - Preserve borders/formatting; set embedded objects to "move with cells" during edits and restore later.
 
-New for S + Diagnostics:
-- Marker tolerant to S / S. / S:
-- Marker detection works for same-row **or** two-line (e.g. "S" on one row, "Work Queue" next row)
-- Header detection is tolerant to "Work Queue Name", "Queue Name", "Queue", etc.
-- Verbose debug for S: prints found marker row, header row, column picks, range, counts, and key mismatches.
+Diagnostics for S:
+- Tolerant marker (S / S. / S:)
+- Header scanning window widened to 80 rows
+- Multiple header heuristics + scored fallback
+- Verbose prints: marker row, header row, chosen columns, content range, counts, key mismatches
 """
 
 import argparse
@@ -61,7 +61,7 @@ def extract_work_queues_from_xml(xml_path: str) -> Dict[str, Dict[str, Optional[
     return wq
 
 
-# =============== DataFrame helpers ===============
+# =============== small utils ===============
 
 def _norm_cell(s) -> str:
     if s is None:
@@ -70,10 +70,6 @@ def _norm_cell(s) -> str:
 
 
 def _normalize_marker_token(s: str) -> str:
-    """
-    Lowercase + trim; if token is a single letter with optional '.' or ':',
-    strip that so 's' == 's.' == 's:'.
-    """
     v = _norm_cell(s)
     return v.rstrip(".:") if re.fullmatch(r"[a-zA-Z][\.:]?", v or "") else v
 
@@ -81,10 +77,8 @@ def _normalize_marker_token(s: str) -> str:
 def _row_contains_all(row_series: pd.Series, keywords: List[str]) -> bool:
     row = [_norm_cell(c) for c in row_series]
     keys = [_norm_cell(k) for k in keywords]
-    # scattered across cells:
     if all(any(k in c for c in row) for k in keys):
         return True
-    # or together in one cell:
     return any(all(k in c for k in keys) for c in row)
 
 
@@ -96,18 +90,11 @@ def _row_contains_all_markers(row_series: pd.Series, keywords: List[str]) -> boo
     return any(all(k in c for k in keys) for c in row)
 
 
-def _two_line_or_same_row_match(df: pd.DataFrame, i: int, group: List[str]) -> bool:
-    if _row_contains_all(df.iloc[i], group):
-        return True
-    if len(group) >= 2 and i + 1 < len(df):
-        if _row_contains_all(df.iloc[i], [group[0]]) and _row_contains_all(df.iloc[i + 1], group[1:]):
-            return True
-    return False
-
-
 def _two_line_or_same_row_match_markers(df: pd.DataFrame, i: int, group: List[str]) -> bool:
+    # same row
     if _row_contains_all_markers(df.iloc[i], group):
         return True
+    # split across two rows (e.g., "S" on row i, "Work Queue" on row i+1)
     if len(group) >= 2 and i + 1 < len(df):
         if _row_contains_all_markers(df.iloc[i], [group[0]]) and _row_contains_all_markers(df.iloc[i + 1], group[1:]):
             return True
@@ -123,7 +110,6 @@ def _last_nonempty_col_index(row_series: pd.Series) -> int:
 
 
 def _excel_col_letter(idx0: int) -> str:
-    """0-based idx -> Excel column letter."""
     n = idx0 + 1
     s = ""
     while n:
@@ -132,89 +118,20 @@ def _excel_col_letter(idx0: int) -> str:
     return s
 
 
-def _row_preview(row_series: pd.Series, max_cols: int = 20) -> str:
+def _row_preview(row_series: pd.Series, max_cells: int = 40) -> str:
     vals = [str(x) for x in row_series.tolist()]
-    vals = [v for v in vals if v.strip() != ""]
-    if len(vals) > max_cols:
-        vals = vals[:max_cols] + ["…"]
-    return " | ".join(vals) if vals else "<all blank>"
-
-
-# =============== Section finding ===============
-
-def find_section(
-    df: pd.DataFrame,
-    section_keywords: List[str],
-    label_for_debug: str,
-    header_any_of: Optional[List[List[str]]] = None,
-    header_keyword: Optional[str] = "name",
-    next_section_groups: Optional[List[List[str]]] = None,
-) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
-    """
-    Locate a section and its coarse boundaries:
-      - marker row: same-row OR two-line; tolerant to S/S./S:
-      - header row: find first row (within ~12 rows) that matches ANY group in header_any_of,
-                    else fallback to header_keyword string
-      - content end: first next section marker or EOF
-    Returns (content_start, content_end_exclusive, name_col_index, header_row_index, next_section_row_index)
-    """
-    # 1) Section start marker row
-    section_start_idx = None
-    for i in range(len(df) - 1):
-        if _two_line_or_same_row_match_markers(df, i, section_keywords):
-            section_start_idx = i
+    trimmed = []
+    for v in vals:
+        vv = v.strip()
+        if vv != "":
+            trimmed.append(vv)
+        if len(trimmed) >= max_cells:
+            trimmed.append("…")
             break
-    if section_start_idx is None:
-        print(f"❌ Could not find section marker {section_keywords} ({label_for_debug})")
-        return None, None, None, None, None
-
-    # 2) Header row (widened scan)
-    header_row_idx = None
-    scan_limit = min(section_start_idx + 12, len(df))
-    if header_any_of:
-        for j in range(section_start_idx + 1, scan_limit):
-            if any(_row_contains_all(df.iloc[j], group) for group in header_any_of):
-                header_row_idx = j
-                break
-    if header_row_idx is None and header_keyword:
-        for j in range(section_start_idx + 1, scan_limit):
-            if _row_contains_all(df.iloc[j], [header_keyword]):
-                header_row_idx = j
-                break
-    if header_row_idx is None:
-        print(f"❌ Could not find header row for {label_for_debug} after marker at row {section_start_idx+1}")
-        return None, None, None, None, None
-
-    content_start = header_row_idx + 1
-
-    # 3) Name column (initial guess using header_keyword fallback)
-    name_col_index = None
-    for col_idx, val in df.iloc[header_row_idx].items():
-        if header_keyword and header_keyword in _norm_cell(val):
-            name_col_index = col_idx
-            break
-
-    # 4) Coarse end
-    next_section_row_idx = None
-    content_end = None
-    if next_section_groups:
-        for k in range(content_start, len(df)):
-            if any(_two_line_or_same_row_match_markers(df, k, grp) for grp in next_section_groups):
-                next_section_row_idx = k
-                content_end = k
-                break
-    if content_end is None:
-        content_end = len(df)
-
-    # Debug (high signal)
-    print(f"🔎 [{label_for_debug}] marker at row {section_start_idx+1}")
-    print(f"   header row at {header_row_idx+1}: {_row_preview(df.iloc[header_row_idx])}")
-    print(f"   tentative Name-col idx={name_col_index} (0-based), coarse content rows {content_start+1}..{content_end} (Excel rows)")
-
-    return content_start, content_end, name_col_index, header_row_idx, next_section_row_idx
+    return " | ".join(trimmed) if trimmed else "<all blank>"
 
 
-# =============== Header helpers ===============
+# =============== header / column finders ===============
 
 def find_no_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
     for col_idx, val in df.iloc[header_row_idx].items():
@@ -240,66 +157,148 @@ def find_keyname_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optiona
 
 
 def _find_wq_name_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
-    """
-    Prefer a header containing both 'work' and 'queue' (e.g., 'Work Queue Name').
-    Else a cell that has 'name' but NOT 'key'.
-    Else the first cell that has 'name'.
-    """
+    # prefer explicit "work queue name"
     candidates = [(col_idx, _norm_cell(val)) for col_idx, val in df.iloc[header_row_idx].items()]
     for col_idx, v in candidates:
-        if ("work" in v) and ("queue" in v):
+        if "work" in v and "queue" in v and "name" in v:
             return col_idx
+    # else "queue name"
     for col_idx, v in candidates:
-        if ("name" in v) and ("key" not in v):
+        if "queue" in v and "name" in v:
             return col_idx
+    # else any "name" not containing "key"
+    for col_idx, v in candidates:
+        if "name" in v and "key" not in v:
+            return col_idx
+    # else any "name"
     for col_idx, v in candidates:
         if "name" in v:
             return col_idx
     return None
 
 
-def _extract_int(s: str) -> Optional[int]:
-    m = re.search(r"\d+", str(s))
-    return int(m.group(0)) if m else None
+# =============== WQ header scoring fallback ===============
 
+def _score_row_for_wq_header(row_series: pd.Series) -> Tuple[int, Dict[str, bool]]:
+    texts = [_norm_cell(x) for x in row_series.tolist()]
+    has = lambda tok: any(tok in t for t in texts)
+    both = lambda a, b: any(a in t for t in texts) and any(b in t for t in texts)
 
-# =============== Shapes/objects placement snapshot ===============
-
-def snapshot_and_set_placement(ws) -> List[tuple]:
-    records: List[tuple] = []
-    for getter, coll_name in (
-        (lambda: ws.api.Shapes, "Shapes"),
-        (lambda: ws.api.ChartObjects(), "ChartObjects"),
-        (lambda: ws.api.OLEObjects(), "OLEObjects"),
-    ):
-        try:
-            coll = getter()
-            count = coll.Count
-        except Exception:
-            count = 0
-        for i in range(1, count + 1):
-            it = coll.Item(i)
-            try:
-                records.append((it.Name, coll_name, it.Placement))
-                it.Placement = 2  # xlMove
-            except Exception:
-                pass
-    return records
-
-
-def restore_placement(ws, records: List[tuple]) -> None:
-    by_type = {
-        "Shapes": lambda: ws.api.Shapes,
-        "ChartObjects": lambda: ws.api.ChartObjects(),
-        "OLEObjects": lambda: ws.api.OLEObjects(),
+    signals = {
+        "work_queue": both("work", "queue"),
+        "queue_name": both("queue", "name"),
+        "key_name":   both("key", "name"),
+        "encrypted":  has("encrypted"),
+        "check":      has("check"),
+        "no":         any(t == "no." or t == "no" or t.startswith("no.") for t in texts),
     }
-    for name, coll_type, placement in records:
-        try:
-            coll = by_type[coll_type]()
-            obj = coll.Item(name)
-            obj.Placement = placement
-        except Exception:
-            pass
+    score = (2 if signals["work_queue"] else 0) \
+          + (2 if signals["key_name"] else 0) \
+          + (1 if signals["queue_name"] else 0) \
+          + (1 if signals["encrypted"] else 0) \
+          + (1 if signals["check"] else 0) \
+          + (1 if signals["no"] else 0)
+    return score, signals
+
+
+# =============== Section finder (robust for S) ===============
+
+def find_section(
+    df: pd.DataFrame,
+    section_keywords: List[str],
+    label_for_debug: str,
+    header_any_of: Optional[List[List[str]]] = None,
+    header_keyword: Optional[str] = "name",
+    next_section_groups: Optional[List[List[str]]] = None,
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
+    # 1) Section start marker row
+    section_start_idx = None
+    for i in range(len(df) - 1):
+        if _two_line_or_same_row_match_markers(df, i, section_keywords):
+            section_start_idx = i
+            break
+    if section_start_idx is None:
+        print(f"❌ Could not find section marker {section_keywords} ({label_for_debug})")
+        return None, None, None, None, None
+
+    print(f"🔎 [{label_for_debug}] marker at row {section_start_idx+1}")
+    print(f"   [{label_for_debug}] Next ~15 rows preview after marker:")
+    for j in range(section_start_idx + 1, min(section_start_idx + 16, len(df))):
+        print(f"     r{j+1}: {_row_preview(df.iloc[j])}")
+
+    # 2) Header row (scan up to 80 rows)
+    header_row_idx = None
+    scan_limit = min(section_start_idx + 80, len(df))
+
+    # explicit patterns (e.g., for S: 'work','queue','name' ; 'key','name' ; 'encrypted' ; 'check')
+    if header_any_of:
+        for j in range(section_start_idx + 1, scan_limit):
+            if all(any(k in _norm_cell(c) for c in df.iloc[j].tolist()) for k in set(sum(header_any_of, []))):
+                # If all tokens across all groups exist somewhere in the row, accept fast
+                header_row_idx = j
+                print(f"   [{label_for_debug}] Header matched by 'token set' presence at row {j+1}")
+                break
+        if header_row_idx is None:
+            # Try group-by-group match (more strict)
+            for j in range(section_start_idx + 1, scan_limit):
+                if all(_row_contains_all(df.iloc[j], grp) for grp in header_any_of):
+                    header_row_idx = j
+                    print(f"   [{label_for_debug}] Header matched by 'all groups' at row {j+1}")
+                    break
+
+    # Fallback to single keyword
+    if header_row_idx is None and header_keyword:
+        for j in range(section_start_idx + 1, scan_limit):
+            if _row_contains_all(df.iloc[j], [header_keyword]):
+                header_row_idx = j
+                print(f"   [{label_for_debug}] Header matched by fallback keyword '{header_keyword}' at row {j+1}")
+                break
+
+    # Scored fallback for S
+    if header_row_idx is None and label_for_debug.lower().startswith("work queue"):
+        best = (-1, None, None)  # (score, idx, signals)
+        for j in range(section_start_idx + 1, scan_limit):
+            score, sig = _score_row_for_wq_header(df.iloc[j])
+            if score > best[0]:
+                best = (score, j, sig)
+        score, j, sig = best
+        print(f"   [Work Queues] top-scored header candidate: row {j+1 if j is not None else '?'} "
+              f"score={score} signals={sig}")
+        if j is not None and score >= 2:
+            header_row_idx = j
+            print(f"   [Work Queues] Header chosen by scoring at row {j+1}")
+
+    if header_row_idx is None:
+        print(f"❌ Could not find header row for {label_for_debug} after marker at row {section_start_idx+1}")
+        return None, None, None, None, None
+
+    content_start = header_row_idx + 1
+
+    # 3) Tentative name col from keyword (may be overridden for S)
+    name_col_index = None
+    if header_keyword:
+        for col_idx, val in df.iloc[header_row_idx].items():
+            if header_keyword in _norm_cell(val):
+                name_col_index = col_idx
+                break
+
+    # 4) Coarse end
+    next_section_row_idx = None
+    content_end = None
+    if next_section_groups:
+        for k in range(content_start, len(df)):
+            if any(_two_line_or_same_row_match_markers(df, k, grp) for grp in next_section_groups):
+                next_section_row_idx = k
+                content_end = k
+                break
+    if content_end is None:
+        content_end = len(df)
+
+    print(f"   [{label_for_debug}] header row at {header_row_idx+1}: {_row_preview(df.iloc[header_row_idx])}")
+    print(f"   [{label_for_debug}] tentative Name-col idx={name_col_index} "
+          f"(Excel col {(_excel_col_letter(name_col_index) if name_col_index is not None else '?')}); "
+          f"coarse content rows {content_start+1}..{content_end} (Excel rows)")
+    return content_start, content_end, name_col_index, header_row_idx, next_section_row_idx
 
 
 # =============== Styling & borders ===============
@@ -364,7 +363,7 @@ def insert_row_with_style(ws, row_num: int) -> None:
     try:
         prev = row_num - 1
         ws.api.Rows(prev).Copy()
-        ws.api.Rows(row_num).PasteSpecial(Paste=-4122)  # formats
+        ws.api.Rows(row_num).PasteSpecial(Paste=-4122)
         ws.api.Rows(row_num).RowHeight = ws.api.Rows(prev).RowHeight
 
         last_col = ws.used_range.last_cell.column
@@ -389,7 +388,12 @@ def insert_row_with_style(ws, row_num: int) -> None:
         pass
 
 
-# =============== Planning helpers ===============
+# =============== planning + writing ===============
+
+def _extract_int(s: str) -> Optional[int]:
+    m = re.search(r"\d+", str(s))
+    return int(m.group(0)) if m else None
+
 
 def _row_has_any_nonblank(series: pd.Series) -> bool:
     return any(str(v).strip() != "" for v in list(series.values))
@@ -430,9 +434,9 @@ def plan_section(
     # Helper columns
     no_col    = find_no_col_in_header(df, header_row_idx)
     check_col = find_check_col_in_header(df, header_row_idx)
-    key_col   = find_keyname_col_in_header(df, header_row_idx)  # relevant for S
+    key_col   = find_keyname_col_in_header(df, header_row_idx)
 
-    # S-specific: pick "Work Queue Name" column if present
+    # S-specific: choose Work Queue Name column robustly
     if label.lower().startswith("work queue"):
         better = _find_wq_name_col_in_header(df, header_row_idx)
         if better is not None:
@@ -441,7 +445,6 @@ def plan_section(
             print("❌ Could not identify a Work Queue Name column in the header row.")
             return None
 
-        # Diagnostics for S
         print(f"   [S] Chosen columns (0-based):")
         print(f"       Work Queue Name col = {name_col} ({_excel_col_letter(name_col)})")
         if key_col is not None:
@@ -454,10 +457,10 @@ def plan_section(
             print(f"       Check col           = {check_col} ({_excel_col_letter(check_col)})")
         print(f"       Validation col      = {validation_col} ({_excel_col_letter(validation_col)})")
 
-    # Slice the coarse section for trimming
+    # Slice coarse section
     coarse_df = df.iloc[content_start:content_end_coarse].copy().reset_index(drop=True)
 
-    # (A) last row with a numeric "No."
+    # (A) last numeric No.
     last_rel_by_no = None
     max_no = None
     if no_col is not None and no_col < coarse_df.shape[1]:
@@ -471,14 +474,14 @@ def plan_section(
                 last_rel_by_no = i
                 break
 
-    # (B) last row with any non-blank cell
+    # (B) last non-blank row
     last_rel_by_any = None
     for i in range(len(coarse_df) - 1, -1, -1):
         if _row_has_any_nonblank(coarse_df.iloc[i]):
             last_rel_by_any = i
             break
 
-    # (C) last row with a non-blank Name
+    # (C) last non-blank Name
     last_rel_by_name = None
     if name_col is not None and name_col < coarse_df.shape[1]:
         for i in range(len(coarse_df) - 1, -1, -1):
@@ -486,7 +489,6 @@ def plan_section(
                 last_rel_by_name = i
                 break
 
-    # Decide true last row (relative)
     if last_rel_by_no is not None:
         last_rel = last_rel_by_no
     elif last_rel_by_any is not None:
@@ -495,12 +497,11 @@ def plan_section(
         last_rel = last_rel_by_name if last_rel_by_name is not None else -1
 
     true_end_rel_exclusive = last_rel + 1 if last_rel >= 0 else 0
-    true_end_abs_exclusive = content_start + true_end_rel_exclusive  # 0-based exclusive
+    true_end_abs_exclusive = content_start + true_end_rel_exclusive
 
-    # Build the trimmed section slice
     section_df = df.iloc[content_start:true_end_abs_exclusive].copy().reset_index(drop=True)
 
-    # Names + validation for existing (trimmed) rows
+    # Names + validation
     name_series = section_df[name_col].astype(str).fillna("").str.strip()
     excel_names = name_series.tolist()
     xml_set     = {x.strip() for x in xml_names}
@@ -508,17 +509,17 @@ def plan_section(
     validation_vals = []
     for nm in excel_names:
         if not nm:
-            validation_vals.append("")         # blank for truly empty rows
+            validation_vals.append("")
         elif nm in xml_set:
             validation_vals.append("Exists")
         else:
             validation_vals.append("Does not exist")
 
-    # Missing names to place
+    # Missing → to place
     excel_set = {n for n in excel_names if n}
     missing   = [n for n in xml_names if n not in excel_set]
 
-    # Fillable rows (blank Name but still part of the table)
+    # Fillable rows: blank Name but still in-table (No. numeric or any other non-blank cell)
     fillable_rel = []
     for i in range(section_df.shape[0]):
         nm = str(section_df.iat[i, name_col]).strip()
@@ -530,18 +531,15 @@ def plan_section(
         if has_no_num or has_other:
             fillable_rel.append(i)
 
-    # Insert anchor: AFTER the last real row we just computed
     last_abs = content_start + (true_end_rel_exclusive - 1) if true_end_rel_exclusive > 0 else header_row_idx
-    insert_at_excel_row = last_abs + 2  # Excel 1-based "+1 after"
+    insert_at_excel_row = last_abs + 2
 
-    # Next value for No.
     if max_no is not None:
         next_no = max_no + 1
     else:
         nonblank_names = sum(1 for v in excel_names if v)
         next_no = nonblank_names + 1 if no_col is not None else None
 
-    # More S diagnostics
     if label.lower().startswith("work queue"):
         print(f"   [S] Content rows (trimmed): Excel {content_start+1}..{true_end_abs_exclusive}")
         print(f"   [S] XML WQ count={len(xml_names)}; existing rows={len(excel_names)}; "
@@ -558,7 +556,7 @@ def plan_section(
         "validation_col": validation_col,
         "no_col": no_col,
         "check_col": check_col,
-        "key_col": key_col,   # only relevant for S
+        "key_col": key_col,
         "header_excel_row": header_row_idx + 1,
         "section_first_excel_row": content_start + 1,
         "section_row_count": true_end_abs_exclusive - content_start,
@@ -581,7 +579,7 @@ def apply_row_offset(plan: Optional[Dict[str, Any]], offset_rows: int) -> Option
     return newp
 
 
-# =============== Workbook write helpers ===============
+# =============== write helpers ===============
 
 def _write_existing_validation(ws, plan: Dict[str, Any]) -> None:
     val_col_excel = plan["validation_col"] + 1
@@ -689,7 +687,6 @@ def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str],
 
 
 def _adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
-    """Return the number of key mismatches found (for debug)."""
     key_col = plan.get("key_col")
     if key_col is None:
         return 0
@@ -727,12 +724,35 @@ def _adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[s
 
 # =============== Orchestration ===============
 
+def _sanitize_sheet_name(name: str) -> str:
+    return re.sub(r'[:\\/?*\[\]]', "_", name).strip()[:31] or "Sheet"
+
+
+def _unique_sheet_name(wb, base: str) -> str:
+    base = _sanitize_sheet_name(base)
+    names = [s.name for s in wb.sheets]
+    name = base
+    i = 2
+    while name in names:
+        suffix = f" ({i})"
+        keep = 31 - len(suffix)
+        name = _sanitize_sheet_name(base[:max(1, keep)] + suffix)
+        i += 1
+    return name
+
+
+def _sheet_by_name_or_index(wb, sheet_arg):
+    if isinstance(sheet_arg, int) or (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()):
+        return wb.sheets[int(sheet_arg)]
+    return wb.sheets[str(sheet_arg)]
+
+
 def validate_and_write_both(
     excel_path: str,
     sheet_arg,
     xml_process_names: List[str],
     xml_object_names: List[str],
-    xml_work_queues: Dict[str, Dict[str, Optional[str]]],  # name -> {'key': ...}
+    xml_work_queues: Dict[str, Dict[str, Optional[str]]],
 ) -> None:
     # Read once for planning
     sheet_arg_for_pd = int(sheet_arg) if (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()) else sheet_arg
@@ -744,23 +764,23 @@ def validate_and_write_both(
         ["C.", "Environment Variables"], ["C", "Environment Variables"],
         ["C.", "environment", "variable"], ["D.", "environment", "variable"], ["D", "environment", "variable"],
         ["E.", "Startup Parameters"], ["E", "Startup Parameters"],
-        ["S.", "work", "queue"], ["S", "work", "queue"]
+        ["S.", "work", "queue"], ["S", "work", "queue"],
     ]
-    next_for_S = None  # run to EOF
+    next_for_S = None  # until EOF
 
-    # A, B: conventional header 'name'
+    # A, B
     plan_A = plan_section(df, ["A.", "Process"], xml_process_names, label="Process",
                           header_any_of=[["name"]], header_keyword="name", next_section_groups=next_for_A)
     plan_B = plan_section(df, ["B.", "Business Object"], xml_object_names, label="Business Object",
                           header_any_of=[["name"]], header_keyword="name", next_section_groups=next_for_B)
 
-    # S: header detection tolerant to various phrasings
+    # S — tuned to your header: No. | Work Queue Name | Key Name | Encrypted | (empty) | Check
     xml_wq_names = list(xml_work_queues.keys())
     s_header_patterns = [
         ["work", "queue", "name"],
-        ["queue", "name"],
-        ["work", "queue"],   # if the word Name is omitted but the column still reads clearly
-        ["queue"],           # last resort
+        ["key", "name"],
+        ["encrypted"],
+        ["check"],
     ]
     plan_S = plan_section(df, ["S.", "work", "queue"], xml_wq_names, label="Work Queues",
                           header_any_of=s_header_patterns, header_keyword="queue", next_section_groups=next_for_S)
@@ -774,7 +794,6 @@ def validate_and_write_both(
         wb = app.books.open(str(excel_path))
         src_sht = _sheet_by_name_or_index(wb, sheet_arg)
 
-        # Safe copy/rename
         try:
             app.api.EnableEvents = False
         except Exception:
@@ -833,7 +852,6 @@ def validate_and_write_both(
         # ----- S -----
         if plan_S is not None:
             print("▶ Processing section S (Work Queues)")
-            # account for rows inserted above
             offset = 0
             if plan_A is not None and plan_S["header_row_idx"] > plan_A["header_row_idx"]:
                 offset += rows_inserted_A
@@ -849,17 +867,14 @@ def validate_and_write_both(
             _apply_borders_like_left(ws, plan_S["header_excel_row"], val_col_excel)
             print(f"   [S] Wrote 'Validation' header at Excel col {_excel_col_letter(plan_S['validation_col'])}, row {plan_S['header_excel_row']}")
 
-            # Existing row validation
             _write_existing_validation(ws, plan_S)
             print(f"   [S] Existing rows validated: {plan_S['section_row_count']}")
 
-            # Fill blanks then insert remaining
             consumed = _fill_into_existing_blanks(ws, plan_S, plan_S["missing"], xml_work_queues)
             remaining = plan_S["missing"][consumed:]
             inserted = _insert_new_rows(ws, plan_S, remaining, xml_work_queues)
-            print(f"   [S] Filled blanks: {consumed}, inserted new rows: {inserted}")
+            print(f"   [S] Filled blanks: {consumed}, inserted rows: {inserted}")
 
-            # Key check
             mismatches = _adjust_wq_key_validation(ws, plan_S, xml_work_queues)
             print(f"   [S] Key Name mismatches found: {mismatches}")
 
@@ -886,29 +901,6 @@ def validate_and_write_both(
 
 
 # =============== CLI ===============
-
-def _sanitize_sheet_name(name: str) -> str:
-    return re.sub(r'[:\\/?*\[\]]', "_", name).strip()[:31] or "Sheet"
-
-
-def _unique_sheet_name(wb, base: str) -> str:
-    base = _sanitize_sheet_name(base)
-    names = [s.name for s in wb.sheets]
-    name = base
-    i = 2
-    while name in names:
-        suffix = f" ({i})"
-        keep = 31 - len(suffix)
-        name = _sanitize_sheet_name(base[:max(1, keep)] + suffix)
-        i += 1
-    return name
-
-
-def _sheet_by_name_or_index(wb, sheet_arg):
-    if isinstance(sheet_arg, int) or (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()):
-        return wb.sheets[int(sheet_arg)]
-    return wb.sheets[str(sheet_arg)]
-
 
 def main():
     parser = argparse.ArgumentParser(
