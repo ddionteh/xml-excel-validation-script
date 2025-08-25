@@ -7,18 +7,19 @@ Supports:
 - B. Business Object
 - S. Work Queues (Work Queue Name + Key Name validation)
 
-Behavior preserved from your original:
+Preserves your behaviors:
 - Fill existing blank Name rows first, then insert remaining.
 - Continue 'No.' numbering.
 - Trim sections to the last real row.
 - Write Validation text + color (green/red/orange).
-- Preserve borders/formatting; set embedded objects to "move with cells" during edits and restore later.
+- Preserve borders/formatting; temporarily set embedded objects to "move with cells".
 
-Diagnostics for S:
-- Tolerant marker (S / S. / S:)
-- Header scanning window widened to 80 rows
-- Multiple header heuristics + scored fallback
-- Verbose prints: marker row, header row, chosen columns, content range, counts, key mismatches
+Extra diagnostics for S (Work Queues):
+- Accepts 'S', 'S.', 'S:' markers.
+- Wider search window for header (80 rows).
+- Synonym-aware column finders for "Work Queue Name" and "Key Name".
+- Verbose prints: marker row, 15-row preview, header row chosen, per-cell header dump,
+  chosen column letters, content range, counts, key mismatches.
 """
 
 import argparse
@@ -63,15 +64,28 @@ def extract_work_queues_from_xml(xml_path: str) -> Dict[str, Dict[str, Optional[
 
 # =============== small utils ===============
 
+_NBSP = "\u00A0"
+
 def _norm_cell(s) -> str:
+    """
+    Normalize cell text for tolerant matching:
+    - convert None -> ""
+    - replace NBSP with space
+    - replace underscores and newlines with space
+    - collapse whitespace, lowercase
+    """
     if s is None:
         return ""
-    return str(s).strip().casefold()
+    v = str(s).replace(_NBSP, " ")
+    v = v.replace("_", " ")
+    v = re.sub(r"[\r\n]+", " ", v)
+    v = re.sub(r"\s+", " ", v).strip().casefold()
+    return v
 
 
 def _normalize_marker_token(s: str) -> str:
     v = _norm_cell(s)
-    return v.rstrip(".:") if re.fullmatch(r"[a-zA-Z][\.:]?", v or "") else v
+    return v.rstrip(".:") if re.fullmatch(r"[a-z][\.:]?", v or "") else v
 
 
 def _row_contains_all(row_series: pd.Series, keywords: List[str]) -> bool:
@@ -91,10 +105,8 @@ def _row_contains_all_markers(row_series: pd.Series, keywords: List[str]) -> boo
 
 
 def _two_line_or_same_row_match_markers(df: pd.DataFrame, i: int, group: List[str]) -> bool:
-    # same row
     if _row_contains_all_markers(df.iloc[i], group):
         return True
-    # split across two rows (e.g., "S" on row i, "Work Queue" on row i+1)
     if len(group) >= 2 and i + 1 < len(df):
         if _row_contains_all_markers(df.iloc[i], [group[0]]) and _row_contains_all_markers(df.iloc[i + 1], group[1:]):
             return True
@@ -149,6 +161,10 @@ def find_check_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[
 
 
 def find_keyname_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
+    """
+    Generic: 'key name' or both 'key' and 'name' appear in the same cell.
+    (Kept for A/B reuse; S has a stronger finder below.)
+    """
     for col_idx, val in df.iloc[header_row_idx].items():
         v = _norm_cell(val)
         if "key name" in v or ("key" in v and "name" in v):
@@ -157,22 +173,43 @@ def find_keyname_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optiona
 
 
 def _find_wq_name_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
-    # prefer explicit "work queue name"
+    """
+    Work Queue 'Name' column:
+    - Prefer "work queue name"
+    - Else "queue name"
+    - Else any "name" without "key"
+    - Else any "name"
+    """
     candidates = [(col_idx, _norm_cell(val)) for col_idx, val in df.iloc[header_row_idx].items()]
     for col_idx, v in candidates:
         if "work" in v and "queue" in v and "name" in v:
             return col_idx
-    # else "queue name"
     for col_idx, v in candidates:
         if "queue" in v and "name" in v:
             return col_idx
-    # else any "name" not containing "key"
     for col_idx, v in candidates:
         if "name" in v and "key" not in v:
             return col_idx
-    # else any "name"
     for col_idx, v in candidates:
         if "name" in v:
+            return col_idx
+    return None
+
+
+def _find_wq_key_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
+    """
+    Work Queue 'Key' column (more tolerant):
+    Accept: "key name", "keyname", "key field", "key", "primary key", "unique key"
+    """
+    synonyms = [
+        "key name", "keyname", "key field", "primary key", "unique key", "key"
+    ]
+    for col_idx, val in df.iloc[header_row_idx].items():
+        v = _norm_cell(val)
+        if any(syn in v for syn in synonyms):
+            # avoid picking 'check' or 'encrypted' or 'queue'
+            if "check" in v or "encrypt" in v or "queue" in v:
+                continue
             return col_idx
     return None
 
@@ -183,11 +220,10 @@ def _score_row_for_wq_header(row_series: pd.Series) -> Tuple[int, Dict[str, bool
     texts = [_norm_cell(x) for x in row_series.tolist()]
     has = lambda tok: any(tok in t for t in texts)
     both = lambda a, b: any(a in t for t in texts) and any(b in t for t in texts)
-
     signals = {
         "work_queue": both("work", "queue"),
         "queue_name": both("queue", "name"),
-        "key_name":   both("key", "name"),
+        "key_name":   both("key", "name") or has("keyname") or has("key field"),
         "encrypted":  has("encrypted"),
         "check":      has("check"),
         "no":         any(t == "no." or t == "no" or t.startswith("no.") for t in texts),
@@ -201,104 +237,49 @@ def _score_row_for_wq_header(row_series: pd.Series) -> Tuple[int, Dict[str, bool
     return score, signals
 
 
-# =============== Section finder (robust for S) ===============
+# =============== Shapes/objects placement snapshot ===============
 
-def find_section(
-    df: pd.DataFrame,
-    section_keywords: List[str],
-    label_for_debug: str,
-    header_any_of: Optional[List[List[str]]] = None,
-    header_keyword: Optional[str] = "name",
-    next_section_groups: Optional[List[List[str]]] = None,
-) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
-    # 1) Section start marker row
-    section_start_idx = None
-    for i in range(len(df) - 1):
-        if _two_line_or_same_row_match_markers(df, i, section_keywords):
-            section_start_idx = i
-            break
-    if section_start_idx is None:
-        print(f"❌ Could not find section marker {section_keywords} ({label_for_debug})")
-        return None, None, None, None, None
+def snapshot_and_set_placement(ws) -> list:
+    """
+    Snapshot Shapes/ChartObjects/OLEObjects placement and set to 'Move but don't size with cells' (2).
+    Return list of (name, collection_type, original_placement) to restore later.
+    Safe on sheets with zero shapes.
+    """
+    records: list = []
+    for getter, coll_name in (
+        (lambda: ws.api.Shapes, "Shapes"),
+        (lambda: ws.api.ChartObjects(), "ChartObjects"),
+        (lambda: ws.api.OLEObjects(), "OLEObjects"),
+    ):
+        try:
+            coll = getter()
+            count = coll.Count
+        except Exception:
+            count = 0
+        for i in range(1, count + 1):
+            it = coll.Item(i)
+            try:
+                records.append((it.Name, coll_name, it.Placement))
+                it.Placement = 2  # xlMove
+            except Exception:
+                pass
+    return records
 
-    print(f"🔎 [{label_for_debug}] marker at row {section_start_idx+1}")
-    print(f"   [{label_for_debug}] Next ~15 rows preview after marker:")
-    for j in range(section_start_idx + 1, min(section_start_idx + 16, len(df))):
-        print(f"     r{j+1}: {_row_preview(df.iloc[j])}")
 
-    # 2) Header row (scan up to 80 rows)
-    header_row_idx = None
-    scan_limit = min(section_start_idx + 80, len(df))
-
-    # explicit patterns (e.g., for S: 'work','queue','name' ; 'key','name' ; 'encrypted' ; 'check')
-    if header_any_of:
-        for j in range(section_start_idx + 1, scan_limit):
-            if all(any(k in _norm_cell(c) for c in df.iloc[j].tolist()) for k in set(sum(header_any_of, []))):
-                # If all tokens across all groups exist somewhere in the row, accept fast
-                header_row_idx = j
-                print(f"   [{label_for_debug}] Header matched by 'token set' presence at row {j+1}")
-                break
-        if header_row_idx is None:
-            # Try group-by-group match (more strict)
-            for j in range(section_start_idx + 1, scan_limit):
-                if all(_row_contains_all(df.iloc[j], grp) for grp in header_any_of):
-                    header_row_idx = j
-                    print(f"   [{label_for_debug}] Header matched by 'all groups' at row {j+1}")
-                    break
-
-    # Fallback to single keyword
-    if header_row_idx is None and header_keyword:
-        for j in range(section_start_idx + 1, scan_limit):
-            if _row_contains_all(df.iloc[j], [header_keyword]):
-                header_row_idx = j
-                print(f"   [{label_for_debug}] Header matched by fallback keyword '{header_keyword}' at row {j+1}")
-                break
-
-    # Scored fallback for S
-    if header_row_idx is None and label_for_debug.lower().startswith("work queue"):
-        best = (-1, None, None)  # (score, idx, signals)
-        for j in range(section_start_idx + 1, scan_limit):
-            score, sig = _score_row_for_wq_header(df.iloc[j])
-            if score > best[0]:
-                best = (score, j, sig)
-        score, j, sig = best
-        print(f"   [Work Queues] top-scored header candidate: row {j+1 if j is not None else '?'} "
-              f"score={score} signals={sig}")
-        if j is not None and score >= 2:
-            header_row_idx = j
-            print(f"   [Work Queues] Header chosen by scoring at row {j+1}")
-
-    if header_row_idx is None:
-        print(f"❌ Could not find header row for {label_for_debug} after marker at row {section_start_idx+1}")
-        return None, None, None, None, None
-
-    content_start = header_row_idx + 1
-
-    # 3) Tentative name col from keyword (may be overridden for S)
-    name_col_index = None
-    if header_keyword:
-        for col_idx, val in df.iloc[header_row_idx].items():
-            if header_keyword in _norm_cell(val):
-                name_col_index = col_idx
-                break
-
-    # 4) Coarse end
-    next_section_row_idx = None
-    content_end = None
-    if next_section_groups:
-        for k in range(content_start, len(df)):
-            if any(_two_line_or_same_row_match_markers(df, k, grp) for grp in next_section_groups):
-                next_section_row_idx = k
-                content_end = k
-                break
-    if content_end is None:
-        content_end = len(df)
-
-    print(f"   [{label_for_debug}] header row at {header_row_idx+1}: {_row_preview(df.iloc[header_row_idx])}")
-    print(f"   [{label_for_debug}] tentative Name-col idx={name_col_index} "
-          f"(Excel col {(_excel_col_letter(name_col_index) if name_col_index is not None else '?')}); "
-          f"coarse content rows {content_start+1}..{content_end} (Excel rows)")
-    return content_start, content_end, name_col_index, header_row_idx, next_section_row_idx
+def restore_placement(ws, records: list) -> None:
+    """Restore placement from snapshot; ignore any missing items gracefully."""
+    by_type = {
+        "Shapes": lambda: ws.api.Shapes,
+        "ChartObjects": lambda: ws.api.ChartObjects(),
+        "OLEObjects": lambda: ws.api.OLEObjects(),
+    }
+    for name, coll_type, placement in records:
+        try:
+            coll = by_type[coll_type]()
+            obj = coll.Item(name)
+            obj.Placement = placement
+        except Exception:
+            pass
 
 
 # =============== Styling & borders ===============
@@ -399,6 +380,113 @@ def _row_has_any_nonblank(series: pd.Series) -> bool:
     return any(str(v).strip() != "" for v in list(series.values))
 
 
+def find_section(
+    df: pd.DataFrame,
+    section_keywords: List[str],
+    label_for_debug: str,
+    header_any_of: Optional[List[List[str]]] = None,
+    header_keyword: Optional[str] = "name",
+    next_section_groups: Optional[List[List[str]]] = None,
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
+    # 1) Section start marker row
+    section_start_idx = None
+    for i in range(len(df) - 1):
+        if _two_line_or_same_row_match_markers(df, i, section_keywords):
+            section_start_idx = i
+            break
+    if section_start_idx is None:
+        print(f"❌ Could not find section marker {section_keywords} ({label_for_debug})")
+        return None, None, None, None, None
+
+    print(f"🔎 [{label_for_debug}] marker at row {section_start_idx+1}")
+    print(f"   [{label_for_debug}] Next ~15 rows preview after marker:")
+    for j in range(section_start_idx + 1, min(section_start_idx + 16, len(df))):
+        print(f"     r{j+1}: {_row_preview(df.iloc[j])}")
+
+    # 2) Header row (scan up to 80 rows)
+    header_row_idx = None
+    scan_limit = min(section_start_idx + 80, len(df))
+
+    # Try: count how many groups this row exhibits; pick best row (>=2 groups for S; >=1 otherwise)
+    best_groups = (-1, None)  # (count, rowidx)
+    if header_any_of:
+        for j in range(section_start_idx + 1, scan_limit):
+            present = 0
+            for grp in header_any_of:
+                if _row_contains_all(df.iloc[j], grp):
+                    present += 1
+            if present > best_groups[0]:
+                best_groups = (present, j)
+        min_needed = 2 if label_for_debug.lower().startswith("work queue") else 1
+        if best_groups[0] >= min_needed:
+            header_row_idx = best_groups[1]
+            print(f"   [{label_for_debug}] Header chosen by group-count={best_groups[0]} at row {header_row_idx+1}")
+
+    # Fallback to single keyword
+    if header_row_idx is None and header_keyword:
+        for j in range(section_start_idx + 1, scan_limit):
+            if _row_contains_all(df.iloc[j], [header_keyword]):
+                header_row_idx = j
+                print(f"   [{label_for_debug}] Header matched by fallback keyword '{header_keyword}' at row {j+1}")
+                break
+
+    # Scored fallback for S
+    if header_row_idx is None and label_for_debug.lower().startswith("work queue"):
+        best = (-1, None, None)  # (score, idx, signals)
+        for j in range(section_start_idx + 1, scan_limit):
+            score, sig = _score_row_for_wq_header(df.iloc[j])
+            if score > best[0]:
+                best = (score, j, sig)
+        score, j, sig = best
+        print(f"   [Work Queues] top-scored header candidate: row {j+1 if j is not None else '?'} "
+              f"score={score} signals={sig}")
+        if j is not None and score >= 2:
+            header_row_idx = j
+            print(f"   [Work Queues] Header chosen by scoring at row {j+1}")
+
+    if header_row_idx is None:
+        print(f"❌ Could not find header row for {label_for_debug} after marker at row {section_start_idx+1}")
+        return None, None, None, None, None
+
+    content_start = header_row_idx + 1
+
+    # 3) Tentative name col from keyword (may be overridden for S)
+    name_col_index = None
+    if header_keyword:
+        for col_idx, val in df.iloc[header_row_idx].items():
+            if header_keyword in _norm_cell(val):
+                name_col_index = col_idx
+                break
+
+    # 4) Coarse end
+    next_section_row_idx = None
+    content_end = None
+    if next_section_groups:
+        for k in range(content_start, len(df)):
+            if any(_two_line_or_same_row_match_markers(df, k, grp) for grp in next_section_groups):
+                next_section_row_idx = k
+                content_end = k
+                break
+    if content_end is None:
+        content_end = len(df)
+
+    print(f"   [{label_for_debug}] header row at {header_row_idx+1}: {_row_preview(df.iloc[header_row_idx])}")
+
+    # Extra: dump header cells for S to help debugging
+    if label_for_debug.lower().startswith("work queue"):
+        hr = df.iloc[header_row_idx]
+        print("   [S] Header cells dump (index/letter -> raw | normalized):")
+        for col_idx, val in hr.items():
+            raw = str(val)
+            norm = _norm_cell(val)
+            print(f"     [{col_idx} / { _excel_col_letter(col_idx) }] -> '{raw}' | norm='{norm}'")
+
+    print(f"   [{label_for_debug}] tentative Name-col idx={name_col_index} "
+          f"(Excel col {(_excel_col_letter(name_col_index) if name_col_index is not None else '?')}); "
+          f"coarse content rows {content_start+1}..{content_end} (Excel rows)")
+    return content_start, content_end, name_col_index, header_row_idx, next_section_row_idx
+
+
 def plan_section(
     df: pd.DataFrame,
     section_keys: List[str],
@@ -436,21 +524,24 @@ def plan_section(
     check_col = find_check_col_in_header(df, header_row_idx)
     key_col   = find_keyname_col_in_header(df, header_row_idx)
 
-    # S-specific: choose Work Queue Name column robustly
+    # S-specific: robust Name and Key columns
     if label.lower().startswith("work queue"):
-        better = _find_wq_name_col_in_header(df, header_row_idx)
-        if better is not None:
-            name_col = better
-        if name_col is None:
-            print("❌ Could not identify a Work Queue Name column in the header row.")
-            return None
+        better_name = _find_wq_name_col_in_header(df, header_row_idx)
+        if better_name is not None:
+            name_col = better_name
 
+        better_key = _find_wq_key_col_in_header(df, header_row_idx) if key_col is None else key_col
+        key_col = better_key
+
+        if name_col is None:
+            print("❌ [S] Could not identify a Work Queue Name column in the header row.")
+            return None
         print(f"   [S] Chosen columns (0-based):")
         print(f"       Work Queue Name col = {name_col} ({_excel_col_letter(name_col)})")
         if key_col is not None:
             print(f"       Key Name col        = {key_col} ({_excel_col_letter(key_col)})")
         else:
-            print(f"       Key Name col        = <not found in header>")
+            print("       Key Name col        = <not found>")
         if no_col is not None:
             print(f"       No. col             = {no_col} ({_excel_col_letter(no_col)})")
         if check_col is not None:
@@ -778,9 +869,10 @@ def validate_and_write_both(
     xml_wq_names = list(xml_work_queues.keys())
     s_header_patterns = [
         ["work", "queue", "name"],
-        ["key", "name"],
+        ["key", "name"], ["keyname"], ["key", "field"],
         ["encrypted"],
         ["check"],
+        ["no."], ["no"],
     ]
     plan_S = plan_section(df, ["S.", "work", "queue"], xml_wq_names, label="Work Queues",
                           header_any_of=s_header_patterns, header_keyword="queue", next_section_groups=next_for_S)
@@ -798,6 +890,7 @@ def validate_and_write_both(
             app.api.EnableEvents = False
         except Exception:
             pass
+
         before = [s.name for s in wb.sheets]
         src_sht.api.Copy(After=src_sht.api)
         after = [s.name for s in wb.sheets]
