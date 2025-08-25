@@ -2,7 +2,7 @@
 """
 Validate names in Excel 'A. Process' and 'B. Business Object' against a Blue Prism release XML.
 Extended to handle:
-- 'S. Work Queues' (Name + Key Name validation)
+- 'S. Work Queues' (Work Queue Name + Key Name validation)
 
 Key behaviors (unchanged from your version):
 - Missing XML names first fill existing blank Name rows inside the section (even if 'No.' already has 4/5/etc),
@@ -14,9 +14,11 @@ Key behaviors (unchanged from your version):
 
 New for 'S. Work Queues':
 - Extract work-queue (name + key-field) from XML.
-- Section detection keyed on tokens ["S.", "work", "queue"] (singular/plural tolerant across split rows).
+- Force the 'Name' column to be 'Work Queue Name' (or a header containing both 'work' and 'queue');
+  fallback to a header that has 'name' but NOT 'key'.
 - For 'Newly added' rows, also writes Key Name column (if present).
 - For existing rows marked 'Exists', validates Key Name and annotates mismatches.
+- Includes inserted rows in the key validation pass.
 """
 
 import argparse
@@ -93,7 +95,6 @@ def _two_line_or_same_row_match(df: pd.DataFrame, i: int, group: List[str]) -> b
     """
     True if row i contains all tokens in 'group' (same row), OR
     row i contains the first token and row i+1 contains the remaining tokens.
-    Handles headers split across two lines (e.g., 'S.' then 'Work Queue(s)').
     """
     if _row_contains_all(df.iloc[i], group):
         return True
@@ -125,7 +126,7 @@ def find_section(
       - content rows end at first row matching one of 'next_section_groups' or EOF
     Returns (content_start, content_end_exclusive, name_col_index, header_row_index, next_section_row_index)
     """
-    # 1) section start marker row
+    # 1) section start marker row (S is in the same row; _row_contains_all is sufficient)
     section_start_idx = None
     for i in range(len(df) - 1):
         if _row_contains_all(df.iloc[i], section_keywords):
@@ -148,7 +149,7 @@ def find_section(
 
     content_start = header_row_idx + 1
 
-    # 3) detect Name column from header row
+    # 3) detect Name column from header row (generic, may be overridden by S-specific logic)
     name_col_index = None
     for col_idx, val in df.iloc[header_row_idx].items():
         if header_keyword in _norm_cell(val):
@@ -201,6 +202,35 @@ def find_keyname_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optiona
         v = _norm_cell(val)
         if "key name" in v or ("key" in v and "name" in v):
             return col_idx
+    return None
+
+
+def _find_wq_name_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
+    """
+    Prefer a header containing both 'work' and 'queue' (e.g., 'Work Queue Name').
+    Else a cell that has 'name' but NOT 'key'.
+    Else the first cell that has 'name'.
+    """
+    candidates = []
+    for col_idx, val in df.iloc[header_row_idx].items():
+        v = _norm_cell(val)
+        candidates.append((col_idx, v))
+
+    # 1) 'work' & 'queue'
+    for col_idx, v in candidates:
+        if ("work" in v) and ("queue" in v):
+            return col_idx
+
+    # 2) 'name' but not 'key'
+    for col_idx, v in candidates:
+        if ("name" in v) and ("key" not in v):
+            return col_idx
+
+    # 3) any 'name'
+    for col_idx, v in candidates:
+        if "name" in v:
+            return col_idx
+
     return None
 
 
@@ -407,6 +437,15 @@ def plan_section(
     check_col = find_check_col_in_header(df, header_row_idx)
     key_col   = find_keyname_col_in_header(df, header_row_idx)  # may be None outside 'S'
 
+    # If this is Work Queues, re-pick the Name column robustly
+    if label.lower().startswith("work queue"):
+        better = _find_wq_name_col_in_header(df, header_row_idx)
+        if better is not None:
+            name_col = better
+        if name_col is None:
+            print("❌ Could not identify a Work Queue Name column in the header row.")
+            return None
+
     # Slice the coarse section for trimming
     coarse_df = df.iloc[content_start:content_end_coarse].copy().reset_index(drop=True)
 
@@ -504,7 +543,7 @@ def plan_section(
         "validation_col": validation_col,
         "no_col": no_col,
         "check_col": check_col,
-        "key_col": key_col,                         # may be None (only relevant for S)
+        "key_col": key_col,                         # may be None outside 'S'
         "header_excel_row": header_row_idx + 1,
         "section_first_excel_row": content_start + 1,
         "section_row_count": true_end_abs_exclusive - content_start,
@@ -514,6 +553,7 @@ def plan_section(
         "missing": missing,
         "next_no": next_no,
         "fillable_rel": fillable_rel,  # relative indices (0..section_row_count-1)
+        "inserted_rows": 0,
     }
 
 
@@ -553,7 +593,7 @@ def _unique_sheet_name(wb, base: str) -> str:
 
 def _sheet_by_name_or_index(wb, sheet_arg):
     """Return an xlwings Sheet by name or 0-based index (string digits allowed)."""
-    if isinstance(sheet_arg, int) or (isinstance(sheet_arg, str) and sheet_arg.isdigit()):
+    if isinstance(sheet_arg, int) or (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()):
         return wb.sheets[int(sheet_arg)]
     return wb.sheets[str(sheet_arg)]
 
@@ -679,7 +719,9 @@ def _insert_new_rows(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: Opt
             clear_fill_preserve_borders(ws, r, check_col_excel)
 
     plan["next_no"] = next_no
-    return len(remaining)
+    inserted = len(remaining)
+    plan["inserted_rows"] = (plan.get("inserted_rows", 0) or 0) + inserted
+    return inserted
 
 
 def _adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> None:
@@ -687,6 +729,7 @@ def _adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[s
     For S. Work Queues:
     - For rows with 'Exists' or 'Newly added', compare Excel 'Key Name' to XML 'key-field'.
     - If mismatch, annotate validation text and set ORANGE; if match, keep existing color/text.
+    Includes newly inserted rows in this pass.
     """
     key_col = plan.get("key_col")
     if key_col is None:
@@ -696,7 +739,9 @@ def _adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[s
     key_col_excel  = key_col + 1
     val_col_excel  = plan["validation_col"] + 1
 
-    for i in range(plan["section_row_count"]):
+    total_rows_to_check = plan["section_row_count"] + (plan.get("inserted_rows", 0) or 0)
+
+    for i in range(total_rows_to_check):
         r = plan["section_first_excel_row"] + i
         nm  = (ws.range((r, name_col_excel)).value or "").strip()
         if not nm or nm not in xml_wq:
@@ -731,7 +776,7 @@ def validate_and_write_both(
     - Duplicate the sheet safely and rename to '<orig>_validated'
     - Write Validation cells (format like left, then color + TEXT)
     - Fill existing blank rows first; then insert new rows for any remaining names
-    - For S: also fill 'Key Name' for newly added, and flag key mismatches
+    - For S: also fill 'Key Name' for newly added, and flag key mismatches (including inserted rows)
     - Preserve objects/placement and autofit Validation column
     """
     # Read once for planning
@@ -788,7 +833,6 @@ def validate_and_write_both(
 
         rows_inserted_A = 0
         rows_inserted_B = 0
-        rows_inserted_S = 0
 
         # ----- Section A: Process -----
         if plan_A is not None:
@@ -833,7 +877,7 @@ def validate_and_write_both(
             except Exception:
                 pass
 
-        # ----- Section S: Work Queues ----- NEW
+        # ----- Section S: Work Queues -----
         if plan_S is not None:
             print("▶ Processing section S (Work Queues)")
             # account for rows inserted above
@@ -856,9 +900,9 @@ def validate_and_write_both(
             # Fill blanks first (write Name + Key if available), then insert remaining
             consumed = _fill_into_existing_blanks(ws, plan_S, plan_S["missing"], xml_work_queues)
             remaining = plan_S["missing"][consumed:]
-            rows_inserted_S = _insert_new_rows(ws, plan_S, remaining, xml_work_queues)
+            _insert_new_rows(ws, plan_S, remaining, xml_work_queues)
 
-            # Post-pass: for rows that 'Exists' or 'Newly added', verify Key Name vs XML
+            # Post-pass: for rows that 'Exists' or 'Newly added', verify Key Name vs XML (includes inserted rows)
             _adjust_wq_key_validation(ws, plan_S, xml_work_queues)
 
             try:
