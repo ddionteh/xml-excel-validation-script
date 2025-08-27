@@ -21,7 +21,7 @@ Requires: pandas, xlwings, openpyxl
 import argparse
 import re
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import pandas as pd
 import xlwings as xw
@@ -52,33 +52,67 @@ def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
     return out
 
 
+# ---------- Work Queue extractor (kept minimal so script is self-contained) ----------
+def extract_work_queues_from_xml(xml_path: str) -> Dict[str, Dict[str, Optional[str]]]:
+    """
+    Returns {work_queue_name: {"key": <key or None>}}.
+    The Blue Prism release format varies; we keep this tolerant:
+    - Looks for <work-queue name="..." key-name="..."> if present
+    - Else tries to infer from stages named 'Work Queue' with attributes
+    If nothing is found, returns {} (the rest of the script handles it gracefully).
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    out: Dict[str, Dict[str, Optional[str]]] = {}
+
+    # Canonical style
+    for elem in root.iter():
+        if _local(elem.tag) in ("work-queue", "workqueue", "workqueue-definition"):
+            nm = (elem.attrib.get("name") or "").strip()
+            key = (elem.attrib.get("key-name") or elem.attrib.get("key") or "").strip()
+            if nm:
+                out[nm] = {"key": key or None}
+
+    # Very rough fallback: search for stages that might describe WQs
+    if not out:
+        for stage in root.iter():
+            if _local(stage.tag) != "stage":
+                continue
+            if (stage.attrib.get("name") or "").strip().lower() == "work queue":
+                wq_nm = (stage.attrib.get("workqueuename") or stage.attrib.get("WorkQueueName") or "").strip()
+                key_nm = (stage.attrib.get("keyname") or stage.attrib.get("KeyName") or "").strip()
+                if wq_nm:
+                    out[wq_nm] = {"key": key_nm or None}
+
+    return out
+
+
 # ---------- ENV(PROD) XML extractors ----------
 def extract_env_variables_from_xml(xml_path: str) -> List[str]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    names = []
+    names: List[str] = []
 
-    # Canonical form
+    # 1) Canonical environment-variable nodes
     for elem in root.iter():
         if _local(elem.tag) == "environment-variable":
             nm = elem.attrib.get("name")
             if nm:
                 names.append(nm.strip())
 
-    # Fallback: container stages named "Environment Variables" / misspelt
-    if not names:
-        targets = set(("environment variables", "environmnet variables"))
-        for stage in root.iter():
-            if _local(stage.tag) != "stage":
-                continue
-            if (stage.attrib.get("name") or "").strip().lower() in targets:
-                for sub in stage.iter():
-                    if _local(sub.tag) == "stage":
-                        nm = (sub.attrib.get("name") or "").strip()
-                        if nm and nm.lower() not in targets:
-                            names.append(nm)
+    # 2) Fallback: a stage container named "Environment Variables" (or misspelt)
+    targets = {"environment variables", "environmnet variables"}
+    for stage in root.iter():
+        if _local(stage.tag) != "stage":
+            continue
+        if (stage.attrib.get("name") or "").strip().lower() in targets:
+            for sub in stage.iter():
+                if _local(sub.tag) == "stage":
+                    nm = (sub.attrib.get("name") or "").strip()
+                    if nm and nm.lower() not in targets:
+                        names.append(nm)
 
-    # any Data stage explicitly exposed as Environment
+    # 3) Any Data stage explicitly exposed as Environment (Blue Prism style)
     for stage in root.iter():
         if _local(stage.tag) != "stage":
             continue
@@ -98,13 +132,16 @@ def extract_env_variables_from_xml(xml_path: str) -> List[str]:
     seen, out = set(), []
     for n in names:
         if n not in seen:
-            seen.add(n); out.append(n)
+            seen.add(n)
+            out.append(n)
     return out
 
+
 def extract_local_data_item_names(xml_path: str) -> List[str]:
+    """All Data stages that are NOT exposed as Environment."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    locals_only = []
+    locals_only: List[str] = []
     for stage in root.iter():
         if _local(stage.tag) != "stage":
             continue
@@ -118,14 +155,15 @@ def extract_local_data_item_names(xml_path: str) -> List[str]:
             if _local(child.tag) == "exposure":
                 exposure = (child.text or "").strip().lower()
                 break
-        if exposure != "environment":   # <- local (not env)
+        if exposure != "environment":
             locals_only.append(name_attr.strip())
 
     # de-dupe preserving order
     seen, out = set(), []
     for n in locals_only:
         if n not in seen:
-            seen.add(n); out.append(n)
+            seen.add(n)
+            out.append(n)
     return out
 
 
@@ -243,16 +281,25 @@ def clear_fill_preserve_borders(ws, row_1based: int, col_1based: int) -> None:
         pass
 
 
+def _sheet_last_col(ws) -> int:
+    """Defensive 'last used column' getter."""
+    try:
+        return ws.used_range.last_cell.column
+    except Exception:
+        # Fallback: assume 100 columns if Excel can't tell us
+        return 100
+
+
 def insert_row_with_style(ws, row_1based: int) -> None:
     ws.api.Rows(row_1based).Insert(Shift=-4121, CopyOrigin=0)  # down
     try:
-        prev = row_1based - 1
+        prev = max(1, row_1based - 1)
         ws.api.Rows(prev).Copy()
         ws.api.Rows(row_1based).PasteSpecial(Paste=-4122)  # formats
         ws.api.Rows(row_1based).RowHeight = ws.api.Rows(prev).RowHeight
 
         # re-create single-row merges
-        last_col = ws.used_range.last_cell.column
+        last_col = _sheet_last_col(ws)
         col = 1
         while col <= last_col:
             cell_above = ws.api.Cells(prev, col)
@@ -270,6 +317,58 @@ def insert_row_with_style(ws, row_1based: int) -> None:
                 pass
             col += 1
         ws.api.Application.CutCopyMode = False
+    except Exception:
+        pass
+
+
+# ===== Shapes/images placement snapshot so they don't drift when inserting rows =====
+
+def snapshot_and_set_placement(ws) -> List[Tuple[str, int]]:
+    """
+    Returns list of (shape_name, original_placement).
+    Sets shapes to xlMove (2) so they move with cells on row insert.
+    If Shapes collection isn't available, returns [].
+    """
+    snap: List[Tuple[str, int]] = []
+    try:
+        shapes = ws.api.Shapes
+        count = shapes.Count
+    except Exception:
+        return snap
+
+    for i in range(1, count + 1):
+        try:
+            shp = shapes.Item(i)
+            name = str(shp.Name)
+            original = int(getattr(shp, "Placement", 2))
+            snap.append((name, original))
+            try:
+                shp.Placement = 2  # xlMove
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return snap
+
+
+def restore_placement(ws, snapshot: List[Tuple[str, int]]) -> None:
+    try:
+        shapes = ws.api.Shapes
+        by_name = {}
+        count = shapes.Count
+        for i in range(1, count + 1):
+            try:
+                shp = shapes.Item(i)
+                by_name[str(shp.Name)] = shp
+            except Exception:
+                pass
+        for name, placement in snapshot:
+            shp = by_name.get(name)
+            if shp is not None:
+                try:
+                    shp.Placement = placement
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -296,9 +395,9 @@ def _row_has_any_nonblank(series: pd.Series) -> bool:
 # ====================== dynamic section model ======================
 
 SECTION_REGISTRY = {
-    "process":                  {"keyword": "process"},
-    "business_object":          {"keyword": "business object"},
-    "work_queue":               {"keyword": "work queue"},
+    "process":                   {"keyword": "process"},
+    "business_object":           {"keyword": "business object"},
+    "work_queue":                {"keyword": "work queue"},
     # ENV(PROD)
     "environment_variable_prod": {"keyword": "environment variable (prod)"},
 }
@@ -997,6 +1096,7 @@ def validate_and_write_dynamic(
 
     # 3) Open Excel; clone sheet; write in visual order (top to bottom)
     app = xw.App(visible=False, add_book=False)
+    wb = None
     try:
         wb = app.books.open(str(excel_path))
         src_sheet = _sheet_by_name_or_index(wb, sheet_arg)
@@ -1076,7 +1176,8 @@ def validate_and_write_dynamic(
         except Exception:
             pass
         try:
-            wb.close()
+            if wb:
+                wb.close()
         except Exception:
             pass
         app.quit()
@@ -1096,14 +1197,7 @@ def main():
     print("🔍 Parsing XML…")
     xml_proc = extract_names_from_xml(args.xml, "process")
     xml_bo = extract_names_from_xml(args.xml, "object")
-    xml_wq = {}  # keep your previous extractor if you need WQ; left blank here to focus on ENV(PROD)
-    # If you still use Work Queues from earlier version, swap in your extract_work_queues_from_xml(...)
-    try:
-        from __main__ import extract_work_queues_from_xml as _maybe_wq
-        xml_wq = _maybe_wq(args.xml)
-    except Exception:
-        xml_wq = {}
-
+    xml_wq = extract_work_queues_from_xml(args.xml)  # harmless if {}
     # ENV(PROD): environment variables and local Data items
     xml_env_prod = extract_env_variables_from_xml(args.xml)
     xml_local_data_names = extract_local_data_item_names(args.xml)
