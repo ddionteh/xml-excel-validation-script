@@ -1,39 +1,40 @@
 #!/usr/bin/env python3
 """
-Validate Excel sections against a Blue Prism release XML.
+Validate Excel sections against a Blue Prism release XML (dynamic sections).
 
-Supports:
-- A. Process
-- B. Business Object
-- S. Work Queues (strict same-row marker: one row must contain 'S' (or 'S.'/'S:') AND 'Work Queue*')
+Adds support for:
+- Environment Variable (PROD): verifies every env var from XML is present in Excel,
+  and flags if any of those names are also defined as a local Data item in the release.
 
-Behaviors:
-- Fill existing blank Name rows first before inserting.
-- Continue numbering in 'No.' where needed.
-- Trim sections to the last real row.
-- Write Validation text + color (green/red/orange).
-- Preserve borders/formatting; set embedded objects to "move with cells" during edits and restore later.
+Core behavior kept:
+- Dynamic section detection via same-row single-letter marker (A..Z with optional '.' or ':')
+  + keyword. Unknown sections still act as boundaries.
+- Dot-insensitive for markers and 'No.' header; case-insensitive for headers;
+  STRICT (trim-only, case-sensitive) for values (names, keys).
+- Header row is the row *after* marker; "Validation" written on that row.
+- 20-row rule: if next marker is >20 rows after header, treat as last (to EOF).
+- Preserves formats/merges/embedded objects when inserting.
 
-Verbose S-focused logging is included so you can see detection decisions.
+Requires: pandas, xlwings, openpyxl
 """
 
 import argparse
 import re
-import string
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 
 import pandas as pd
 import xlwings as xw
 
 
-# =============== XML helpers ===============
+# ========================= XML helpers =========================
 
 def _local(tag: str) -> str:
     return tag.split('}', 1)[1] if tag.startswith('{') else tag
 
 
 def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
+    """Return ordered unique list of names for <process name="…"> or <object name="…">."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     names: List[str] = []
@@ -42,387 +43,160 @@ def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
             name_attr = elem.attrib.get('name')
             if name_attr:
                 names.append(name_attr.strip())
-    return list(dict.fromkeys(names))  # order-preserving unique
+    seen = set()
+    out: List[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
 
 
-def extract_work_queues_from_xml(xml_path: str) -> Dict[str, Dict[str, Optional[str]]]:
-    """
-    { name: {'key': <key-field or ''>} }
-    """
+# ---------- ENV(PROD) XML extractors ----------
+def extract_env_variables_from_xml(xml_path: str) -> List[str]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    wq: Dict[str, Dict[str, Optional[str]]] = {}
+    names = []
+
+    # Canonical form
     for elem in root.iter():
-        if _local(elem.tag) == "work-queue":
-            name = (elem.attrib.get("name") or "").strip()
-            key = (elem.attrib.get("key-field") or "").strip()
-            if name and name not in wq:
-                wq[name] = {"key": key}
-    return wq
+        if _local(elem.tag) == "environment-variable":
+            nm = elem.attrib.get("name")
+            if nm:
+                names.append(nm.strip())
+
+    # Fallback: container stages named "Environment Variables" / misspelt
+    if not names:
+        targets = set(("environment variables", "environmnet variables"))
+        for stage in root.iter():
+            if _local(stage.tag) != "stage":
+                continue
+            if (stage.attrib.get("name") or "").strip().lower() in targets:
+                for sub in stage.iter():
+                    if _local(sub.tag) == "stage":
+                        nm = (sub.attrib.get("name") or "").strip()
+                        if nm and nm.lower() not in targets:
+                            names.append(nm)
+
+    # any Data stage explicitly exposed as Environment
+    for stage in root.iter():
+        if _local(stage.tag) != "stage":
+            continue
+        if (stage.attrib.get("type") or "").strip().lower() == "data":
+            name_attr = stage.attrib.get("name")
+            if not name_attr:
+                continue
+            exposure = None
+            for child in stage:
+                if _local(child.tag) == "exposure":
+                    exposure = (child.text or "").strip().lower()
+                    break
+            if exposure == "environment":
+                names.append(name_attr.strip())
+
+    # de-dupe preserving order
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n); out.append(n)
+    return out
+
+def extract_local_data_item_names(xml_path: str) -> List[str]:
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    locals_only = []
+    for stage in root.iter():
+        if _local(stage.tag) != "stage":
+            continue
+        if (stage.attrib.get("type") or "").strip().lower() != "data":
+            continue
+        name_attr = stage.attrib.get("name") or stage.attrib.get("Name")
+        if not name_attr:
+            continue
+        exposure = None
+        for child in stage:
+            if _local(child.tag) == "exposure":
+                exposure = (child.text or "").strip().lower()
+                break
+        if exposure != "environment":   # <- local (not env)
+            locals_only.append(name_attr.strip())
+
+    # de-dupe preserving order
+    seen, out = set(), []
+    for n in locals_only:
+        if n not in seen:
+            seen.add(n); out.append(n)
+    return out
 
 
-# =============== String / cell normalization ===============
+# ==================== normalization / tokens ====================
 
-def _to_space(s: str) -> str:
-    if s is None:
+NBSPS = ("\u00A0", "\u2007", "\u202F")
+
+
+def _to_space(value) -> str:
+    if value is None:
         return ""
-    # normalize NBSP and control whitespace
-    return str(s).replace("\u00A0", " ").replace("\u2007", " ").replace("\u202F", " ")
+    text = str(value)
+    for nb in NBSPS:
+        text = text.replace(nb, " ")
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
-def _norm_cell(s) -> str:
-    return _to_space(s).strip().casefold()
+def _norm(value) -> str:
+    return _to_space(value).strip().casefold()
 
 
-def _is_letter_marker(cell_val: str, letter: str) -> bool:
-    """
-    True if cell is exactly that letter with optional trailing '.' or ':' (case-insensitive),
-    ignoring leading/trailing spaces and NBSPs.
-    e.g. 'S', 'S.', 'S:' -> True for 's'
-    """
-    v = _norm_cell(cell_val)
+def _cell_is_single_letter_marker(cell_val: str) -> bool:
+    """True if cell is exactly A..Z (any case) with optional trailing '.' or ':'."""
+    v = _norm(cell_val)
     if not v:
         return False
-    if len(v) == 1:
-        return v == letter
-    if len(v) == 2 and v[0] == letter and v[1] in ('.', ':'):
+    if len(v) == 1 and v.isalpha():
+        return True
+    if len(v) == 2 and v[0].isalpha() and v[1] in ('.', ':'):
         return True
     return False
 
 
-def _row_tokens(row_series: pd.Series) -> List[str]:
-    return [_norm_cell(c) for c in row_series]
+def _row_tokens(row: pd.Series) -> List[str]:
+    return [_norm(c) for c in row]
 
 
-def _has_tokens_same_row(row_series: pd.Series, tokens: List[str]) -> bool:
-    """
-    Every token must appear (as substring) in some cell on the SAME row.
-    """
-    row = _row_tokens(row_series)
-    return all(any(tok in c for c in row) for tok in tokens)
+def _excel_row(idx0: int) -> int:
+    return idx0 + 1
 
 
 def _excel_col_letter(col0: int) -> str:
-    # 0-based index -> Excel letter
     col = col0 + 1
-    letters = ""
+    label = ""
     while col:
         col, rem = divmod(col - 1, 26)
-        letters = chr(65 + rem) + letters
-    return letters
+        label = chr(65 + rem) + label
+    return label
 
 
-# =============== Simple row dumps for debugging ===============
-
-def _dump_row(row_idx: int, row_series: pd.Series, max_cols: int = 20) -> str:
+def _dump_row(row_index: int, row: pd.Series, max_cols: int = 20) -> str:
     parts = []
-    for j, val in enumerate(row_series[:max_cols]):
-        parts.append(f"[{_excel_col_letter(j)}] '{_to_space(val).strip()}'")
-    return f"r{row_idx} -> " + " | ".join(parts)
+    for col_index, cell_value in enumerate(row.iloc[:max_cols]):
+        parts.append(f"[{_excel_col_letter(col_index)}] '{_to_space(cell_value).strip()}'")
+    return f"r{row_index} -> " + " | ".join(parts)
 
 
-# =============== Section A/B helpers (unchanged logic) ===============
+# ===================== formatting / borders =====================
 
-def _row_contains_all(row_series: pd.Series, keywords: List[str]) -> bool:
-    row = _row_tokens(row_series)
-    keys = [_norm_cell(k) for k in keywords]
-    if all(any(k in c for c in row) for k in keys):
-        return True
-    return any(all(k in c for k in keys) for c in row)
+COLOR_GREEN = (198, 239, 206)   # Exists
+COLOR_RED = (255, 199, 206)     # Does not exist
+COLOR_ORANGE = (255, 235, 156)  # Newly added / Attention
 
-
-def _two_line_or_same_row_match(df: pd.DataFrame, i: int, group: List[str]) -> bool:
-    if _row_contains_all(df.iloc[i], group):
-        return True
-    if len(group) >= 2 and i + 1 < len(df):
-        if _row_contains_all(df.iloc[i], [group[0]]) and _row_contains_all(df.iloc[i + 1], group[1:]):
-            return True
-    return False
-
-
-def _last_nonempty_col_index(row_series: pd.Series) -> int:
-    last = -1
-    for col_idx, val in row_series.items():
-        if _to_space(val).strip() != "":
-            last = col_idx
-    return last
-
-
-def find_section_generic(
-    df: pd.DataFrame,
-    section_keywords: List[str],
-    header_keyword: str = "name",
-    next_section_groups: Optional[List[List[str]]] = None,
-) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
-    """
-    Generic locator for A/B (kept for backward-compat).
-    """
-    section_start_idx = None
-    for i in range(len(df) - 1):
-        if _row_contains_all(df.iloc[i], section_keywords):
-            section_start_idx = i
-            break
-    if section_start_idx is None:
-        return None, None, None, None, None
-
-    header_row_idx = None
-    scan_limit = min(section_start_idx + 12, len(df))
-    for j in range(section_start_idx + 1, scan_limit):
-        if _row_contains_all(df.iloc[j], [header_keyword]):
-            header_row_idx = j
-            break
-    if header_row_idx is None:
-        return None, None, None, None, None
-
-    content_start = header_row_idx + 1
-
-    name_col_index = None
-    for col_idx, val in df.iloc[header_row_idx].items():
-        if header_keyword in _norm_cell(val):
-            name_col_index = col_idx
-            break
-    if name_col_index is None:
-        return None, None, None, None, None
-
-    next_section_row_idx = None
-    content_end = None
-    if next_section_groups:
-        for k in range(content_start, len(df)):
-            if any(_two_line_or_same_row_match(df, k, grp) for grp in next_section_groups):
-                next_section_row_idx = k
-                content_end = k
-                break
-    if content_end is None:
-        content_end = len(df)
-
-    return content_start, content_end, name_col_index, header_row_idx, next_section_row_idx
-
-
-# =============== S. Work Queues — strict same-row marker ===============
-
-def find_S_marker_row(df: pd.DataFrame, verbose: bool = True) -> Optional[int]:
-    """
-    SAME ROW must contain:
-      - a cell that's exactly 'S'/'S.'/'S:'  (ignoring case/space)
-      - AND a cell containing 'work' and 'queue'
-    """
-    for i in range(len(df)):
-        row = df.iloc[i]
-        has_s = any(_is_letter_marker(c, 's') for c in row)
-        has_wq = any(('work' in _norm_cell(c) and 'queue' in _norm_cell(c)) for c in row)
-        if has_s and has_wq:
-            if verbose:
-                print(f"[S] Marker found at row {i} (Excel {_excel_row(i)}).")
-                print("     " + _dump_row(i, row))
-            return i
-    if verbose:
-        print("[S] ❌ No marker row found that has BOTH 'S' and 'Work Queue' on the same row.")
-    return None
-
-
-def find_S_header_row(df: pd.DataFrame, marker_row: int, lookahead: int = 80, verbose: bool = True) -> Optional[int]:
-    """
-    After marker, locate the header row by scoring signals commonly present in S headers:
-      - 'work' & 'queue' & 'name' together (+2)
-      - 'key name' / 'keyname' / 'key field' / 'key column' / 'primary key' / 'unique key' / 'key' (+2 if strong, +1 if just 'key')
-      - 'no' / 'no.' (+1)
-      - 'encrypted' (+1)
-      - 'check' (+1)
-    We pick the highest score >= 2.
-    """
-    best_row, best_score = None, -1
-
-    for j in range(marker_row + 1, min(marker_row + 1 + lookahead, len(df))):
-        row = df.iloc[j]
-        vals = [_norm_cell(c) for c in row]
-
-        work_queue_name = any(("work" in v and "queue" in v and "name" in v) for v in vals)
-        has_queue = any(("work" in v and "queue" in v) for v in vals)
-        key_strong = any(("key name" in v or "keyname" in v or "key field" in v or "key column" in v
-                          or "primary key" in v or "unique key" in v) for v in vals)
-        key_any = key_strong or any(v == "key" or v.startswith("key ") for v in vals)
-        has_no = any(v == "no." or v == "no" or v.startswith("no.") for v in vals)
-        has_encrypted = any("encrypted" in v for v in vals)
-        has_check = any("check" in v for v in vals)
-
-        score = 0
-        if work_queue_name: score += 2
-        if has_queue and not work_queue_name: score += 1  # weaker
-        if key_strong: score += 2
-        elif key_any: score += 1
-        if has_no: score += 1
-        if has_encrypted: score += 1
-        if has_check: score += 1
-
-        if score > best_score:
-            best_score, best_row = score, j
-
-        # print a small preview for the first 15 rows after marker
-        if verbose and j <= marker_row + 15:
-            print(f"[S] header-candidate r{j} score={score}: " + _dump_row(j, row))
-
-    if best_row is not None and best_score >= 2:
-        if verbose:
-            print(f"[S] Header chosen r{best_row} (Excel {_excel_row(best_row)}), score={best_score}")
-            print("     " + _dump_row(best_row, df.iloc[best_row]))
-        return best_row
-
-    if verbose:
-        print("[S] ❌ Could not find a convincing header row after the marker.")
-    return None
-
-
-def pick_S_columns(df: pd.DataFrame, header_row: int, verbose: bool = True) -> Dict[str, Optional[int]]:
-    """
-    Resolve columns for: no_col, wq_name_col, key_col, encrypted_col, check_col, validation_col
-    """
-    cols = list(df.iloc[header_row].items())
-    norm = [(_norm_cell(v), idx) for idx, v in df.iloc[header_row].items()]
-
-    # Work Queue Name
-    wq_name_col = None
-    for v, idx in norm:
-        if ("work" in v and "queue" in v and "name" in v):
-            wq_name_col = idx
-            break
-    if wq_name_col is None:
-        for v, idx in norm:
-            if ("queue" in v and "name" in v):
-                wq_name_col = idx
-                break
-    if wq_name_col is None:
-        for v, idx in norm:
-            if "name" in v and "key" not in v:
-                wq_name_col = idx
-                break
-
-    # Key Name
-    key_col = None
-    for v, idx in norm:
-        if ("key name" in v or "keyname" in v or "key field" in v or "key column" in v
-            or "primary key" in v or "unique key" in v):
-            key_col = idx
-            break
-    if key_col is None:
-        for v, idx in norm:
-            if v == "key" or v.startswith("key "):
-                key_col = idx
-                break
-
-    # No.
-    no_col = None
-    for v, idx in norm:
-        if v == "no." or v == "no" or v.startswith("no."):
-            no_col = idx
-            break
-
-    # Encrypted
-    encrypted_col = None
-    for v, idx in norm:
-        if "encrypted" in v:
-            encrypted_col = idx
-            break
-
-    # Check
-    check_col = None
-    for v, idx in norm:
-        if "check" in v:
-            check_col = idx
-            break
-
-    # Validation (reuse if present; else next new col)
-    validation_col = None
-    for v, idx in norm:
-        if v == "validation":
-            validation_col = idx
-            break
-    if validation_col is None:
-        validation_col = _last_nonempty_col_index(df.iloc[header_row]) + 1
-
-    if verbose:
-        print("[S] Resolved columns (0-based):")
-        print(f"    Work Queue Name: {wq_name_col} ({_excel_col_letter(wq_name_col) if wq_name_col is not None else 'N/A'})")
-        print(f"    Key Name       : {key_col} ({_excel_col_letter(key_col) if key_col is not None else 'N/A'})")
-        print(f"    No.            : {no_col} ({_excel_col_letter(no_col) if no_col is not None else 'N/A'})")
-        print(f"    Encrypted      : {encrypted_col} ({_excel_col_letter(encrypted_col) if encrypted_col is not None else 'N/A'})")
-        print(f"    Check          : {check_col} ({_excel_col_letter(check_col) if check_col is not None else 'N/A'})")
-        print(f"    Validation     : {validation_col} ({_excel_col_letter(validation_col)})")
-
-    return {
-        "wq_name_col": wq_name_col,
-        "key_col": key_col,
-        "no_col": no_col,
-        "encrypted_col": encrypted_col,
-        "check_col": check_col,
-        "validation_col": validation_col,
-    }
-
-
-# =============== Planning & trim helpers (shared) ===============
-
-def _extract_int(s: str) -> Optional[int]:
-    m = re.search(r"\d+", _to_space(s))
-    return int(m.group(0)) if m else None
-
-
-def _row_has_any_nonblank(series: pd.Series) -> bool:
-    return any(_to_space(v).strip() != "" for v in list(series.values))
-
-
-def _excel_row(i0: int) -> int:
-    return i0 + 1
-
-
-# =============== Shapes/objects placement snapshot ===============
-
-def snapshot_and_set_placement(ws) -> List[tuple]:
-    records: List[tuple] = []
-    for getter, coll_name in (
-        (lambda: ws.api.Shapes, "Shapes"),
-        (lambda: ws.api.ChartObjects(), "ChartObjects"),
-        (lambda: ws.api.OLEObjects(), "OLEObjects"),
-    ):
-        try:
-            coll = getter()
-            count = coll.Count
-        except Exception:
-            count = 0
-        for i in range(1, count + 1):
-            it = coll.Item(i)
-            try:
-                records.append((it.Name, coll_name, it.Placement))
-                it.Placement = 2  # xlMove
-            except Exception:
-                pass
-    return records
-
-
-def restore_placement(ws, records: List[tuple]) -> None:
-    by_type = {
-        "Shapes": lambda: ws.api.Shapes,
-        "ChartObjects": lambda: ws.api.ChartObjects(),
-        "OLEObjects": lambda: ws.api.OLEObjects(),
-    }
-    for name, coll_type, placement in records:
-        try:
-            coll = by_type[coll_type]()
-            obj = coll.Item(name)
-            obj.Placement = placement
-        except Exception:
-            pass
-
-
-# =============== Styling & borders ===============
-
-COLOR_GREEN  = (198, 239, 206)  # Exists
-COLOR_RED    = (255, 199, 206)  # Does not exist
-COLOR_ORANGE = (255, 235, 156)  # Newly added / Key mismatch attention
 
 def _clone_borders(from_cell_api, to_cell_api) -> None:
-    for idx in (7, 8, 9, 10, 11, 12):
+    for border_id in (7, 8, 9, 10, 11, 12):
         try:
-            bsrc = from_cell_api.Borders(idx)
-            bdst = to_cell_api.Borders(idx)
+            bsrc = from_cell_api.Borders(border_id)
+            bdst = to_cell_api.Borders(border_id)
             bdst.LineStyle = bsrc.LineStyle
             bdst.Weight = bsrc.Weight
             bdst.Color = bsrc.Color
@@ -435,401 +209,511 @@ def _clone_borders(from_cell_api, to_cell_api) -> None:
         pass
 
 
-def _apply_borders_like_left(ws, row: int, col_excel: int) -> None:
-    if col_excel <= 1:
+def _apply_borders_like_left(ws, row_1based: int, col_1based: int) -> None:
+    if col_1based <= 1:
         return
     try:
-        left = ws.api.Cells(row, col_excel - 1)
-        dst  = ws.api.Cells(row, col_excel)
+        left = ws.api.Cells(row_1based, col_1based - 1)
+        dst = ws.api.Cells(row_1based, col_1based)
         _clone_borders(left, dst)
     except Exception:
         pass
 
 
-def paste_formats_like_left(ws, row: int, col_excel: int) -> None:
-    if col_excel <= 1:
+def paste_formats_like_left(ws, row_1based: int, col_1based: int) -> None:
+    if col_1based <= 1:
         return
     try:
-        ws.api.Cells(row, col_excel - 1).Copy()
-        ws.api.Cells(row, col_excel).PasteSpecial(Paste=-4122)  # xlPasteFormats
+        ws.api.Cells(row_1based, col_1based - 1).Copy()
+        ws.api.Cells(row_1based, col_1based).PasteSpecial(Paste=-4122)  # xlPasteFormats
         ws.api.Application.CutCopyMode = False
     except Exception:
         pass
 
 
-def clear_fill_preserve_borders(ws, row: int, col_excel: int) -> None:
+def clear_fill_preserve_borders(ws, row_1based: int, col_1based: int) -> None:
     try:
-        dst = ws.api.Cells(row, col_excel)
-        dst.Interior.Pattern = -4142
+        dst = ws.api.Cells(row_1based, col_1based)
+        dst.Interior.Pattern = -4142  # none
         dst.Interior.TintAndShade = 0
         dst.Interior.PatternTintAndShade = 0
-        if row > 1:
-            _clone_borders(ws.api.Cells(row - 1, col_excel), dst)
+        if row_1based > 1:
+            _clone_borders(ws.api.Cells(row_1based - 1, col_1based), dst)
     except Exception:
         pass
 
 
-def insert_row_with_style(ws, row_num: int) -> None:
-    ws.api.Rows(row_num).Insert(Shift=-4121, CopyOrigin=0)
+def insert_row_with_style(ws, row_1based: int) -> None:
+    ws.api.Rows(row_1based).Insert(Shift=-4121, CopyOrigin=0)  # down
     try:
-        prev = row_num - 1
+        prev = row_1based - 1
         ws.api.Rows(prev).Copy()
-        ws.api.Rows(row_num).PasteSpecial(Paste=-4122)
-        ws.api.Rows(row_num).RowHeight = ws.api.Rows(prev).RowHeight
+        ws.api.Rows(row_1based).PasteSpecial(Paste=-4122)  # formats
+        ws.api.Rows(row_1based).RowHeight = ws.api.Rows(prev).RowHeight
 
+        # re-create single-row merges
         last_col = ws.used_range.last_cell.column
-        c = 1
-        while c <= last_col:
-            cell_above = ws.api.Cells(prev, c)
+        col = 1
+        while col <= last_col:
+            cell_above = ws.api.Cells(prev, col)
             try:
                 if cell_above.MergeCells:
                     area = cell_above.MergeArea
-                    if area.Column == c and area.Rows.Count == 1:
-                        left_col = area.Column
+                    if area.Column == col and area.Rows.Count == 1:
+                        left = area.Column
                         width = area.Columns.Count
-                        ws.api.Range(ws.api.Cells(row_num, left_col),
-                                     ws.api.Cells(row_num, left_col + width - 1)).Merge()
-                        c += width
+                        ws.api.Range(ws.api.Cells(row_1based, left),
+                                     ws.api.Cells(row_1based, left + width - 1)).Merge()
+                        col += width
                         continue
             except Exception:
                 pass
-            c += 1
+            col += 1
         ws.api.Application.CutCopyMode = False
     except Exception:
         pass
 
 
-# =============== Common write helpers ===============
+# ===================== small helpers / parsing =====================
 
-def find_no_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
-    for col_idx, val in df.iloc[header_row_idx].items():
-        v = _norm_cell(val)
-        if v == "no." or v == "no" or v.startswith("no."):
-            return col_idx
+def _last_nonempty_col_index(row: pd.Series) -> int:
+    last_index = -1
+    for col_index, cell in row.items():
+        if _to_space(cell).strip() != "":
+            last_index = col_index
+    return last_index
+
+
+def _extract_int(text: str) -> Optional[int]:
+    match = re.search(r"\d+", _to_space(text))
+    return int(match.group(0)) if match else None
+
+
+def _row_has_any_nonblank(series: pd.Series) -> bool:
+    return any(_to_space(v).strip() != "" for v in list(series.values))
+
+
+# ====================== dynamic section model ======================
+
+SECTION_REGISTRY = {
+    "process":                  {"keyword": "process"},
+    "business_object":          {"keyword": "business object"},
+    "work_queue":               {"keyword": "work queue"},
+    # ENV(PROD)
+    "environment_variable_prod": {"keyword": "environment variable (prod)"},
+}
+
+
+def _row_has_keyword(row: pd.Series, phrase: str) -> bool:
+    ph = _norm(phrase)
+    return any(ph in _norm(c) for c in row)
+
+
+def _row_has_single_letter_marker(row: pd.Series) -> bool:
+    return any(_cell_is_single_letter_marker(c) for c in row)
+
+
+def find_dynamic_markers(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    A row is a marker if it contains a cell that is exactly a single letter (A..Z) with
+    optional '.' or ':' (dot-insensitive). If the same row also contains a known keyword,
+    we type it; otherwise type 'unknown'. Unknown markers still bound sections.
+    """
+    markers: List[Dict[str, Any]] = []
+    for row_index in range(len(df)):
+        row = df.iloc[row_index]
+        if not _row_has_single_letter_marker(row):
+            continue
+        label = "unknown"
+        for section_type, meta in SECTION_REGISTRY.items():
+            if _row_has_keyword(row, meta["keyword"]):
+                label = section_type
+                break
+        markers.append({"row": row_index, "type": label})
+    return markers
+
+
+# ===================== header & column resolvers =====================
+
+def find_header_after_marker(df: pd.DataFrame, marker_row: int, section_type: str, lookahead: int = 80) -> Optional[int]:
+    """
+    Find the header row for a section after its marker.
+
+    - process / business_object / environment_variable_prod: first nonblank row having 'name' in any cell.
+    - work_queue: first nonblank row having BOTH:
+        * a cell containing 'work' AND 'queue' AND 'name'
+        * a cell containing 'key' AND 'name'
+    """
+    end_row = min(len(df), marker_row + 1 + lookahead)
+    for row_index in range(marker_row + 1, end_row):
+        tokens = _row_tokens(df.iloc[row_index])
+        if all(v == "" for v in tokens):
+            continue
+
+        if section_type in ("process", "business_object", "environment_variable_prod"):
+            if any("name" in v for v in tokens):
+                return row_index
+
+        elif section_type == "work_queue":
+            has_wq_name = any(("work" in v and "queue" in v and "name" in v) for v in tokens)
+            has_key_name = any(("key" in v and "name" in v) for v in tokens)
+            if has_wq_name and has_key_name:
+                return row_index
+
     return None
 
 
-def find_check_col_in_header(df: pd.DataFrame, header_row_idx: int) -> Optional[int]:
-    for col_idx, val in df.iloc[header_row_idx].items():
-        if "check" in _norm_cell(val):
-            return col_idx
-    return None
+def pick_columns(df: pd.DataFrame, header_row: int, section_type: str) -> Dict[str, Optional[int]]:
+    """Return column indices for the section."""
+    normed = [(_norm(v), idx) for idx, v in df.iloc[header_row].items()]
 
-
-def _write_existing_validation(ws, section_first_excel_row: int, validation_col0: int, statuses: List[str]) -> None:
-    val_col_excel = validation_col0 + 1
-    start_row     = section_first_excel_row
-    for i, status in enumerate(statuses):
-        r = start_row + i
-        paste_formats_like_left(ws, r, val_col_excel)
-        ws.range((r, val_col_excel)).value = status if status else ""
-        st = (status or "").lower()
-        if st == "exists":
-            ws.range((r, val_col_excel)).color = COLOR_GREEN
-        elif st == "does not exist":
-            ws.range((r, val_col_excel)).color = COLOR_RED
-        else:
-            ws.range((r, val_col_excel)).color = None
-        _apply_borders_like_left(ws, r, val_col_excel)
-
-
-# =============== Planning for S (strict) and generic A/B ===============
-
-def plan_section_AB(df: pd.DataFrame, section_keys: List[str], xml_names: List[str],
-                    label: str, header_keyword: str, next_section_groups: Optional[List[List[str]]]) -> Optional[Dict[str, Any]]:
-    found = find_section_generic(df, section_keys, header_keyword=header_keyword, next_section_groups=next_section_groups)
-    content_start, content_end_coarse, name_col, header_row_idx, _ = found
-    if content_start is None:
-        return None
-
-    header_row = df.iloc[header_row_idx]
+    # Validation column (reuse or next empty to the right)
     validation_col = None
-    for col_idx, val in header_row.items():
-        if _norm_cell(val) == "validation":
-            validation_col = col_idx
+    for text, idx in normed:
+        if text == "validation":
+            validation_col = idx
             break
     if validation_col is None:
-        validation_col = _last_nonempty_col_index(header_row) + 1
+        validation_col = _last_nonempty_col_index(df.iloc[header_row]) + 1
 
-    no_col    = find_no_col_in_header(df, header_row_idx)
-    check_col = find_check_col_in_header(df, header_row_idx)
-
-    coarse_df = df.iloc[content_start:content_end_coarse].copy().reset_index(drop=True)
-
-    last_rel_by_no = None
-    max_no = None
-    if no_col is not None and no_col < coarse_df.shape[1]:
-        for i in range(len(coarse_df)):
-            val = _extract_int(coarse_df.iat[i, no_col])
-            if val is not None:
-                max_no = val if (max_no is None or val > max_no) else max_no
-        for i in range(len(coarse_df) - 1, -1, -1):
-            val = _extract_int(coarse_df.iat[i, no_col])
-            if val is not None:
-                last_rel_by_no = i
-                break
-
-    last_rel_by_any = None
-    for i in range(len(coarse_df) - 1, -1, -1):
-        if _row_has_any_nonblank(coarse_df.iloc[i]):
-            last_rel_by_any = i
+    # No. (dot-insensitive)
+    no_col = None
+    for text, idx in normed:
+        if text == "no" or text == "no." or text.startswith("no."):
+            no_col = idx
             break
 
-    last_rel_by_name = None
-    if name_col is not None and name_col < coarse_df.shape[1]:
-        for i in range(len(coarse_df) - 1, -1, -1):
-            if _to_space(coarse_df.iat[i, name_col]).strip() != "":
-                last_rel_by_name = i
+    # Check (optional)
+    check_col = None
+    for text, idx in normed:
+        if "check" in text:
+            check_col = idx
+            break
+
+    if section_type in ("process", "business_object", "environment_variable_prod"):
+        name_col = None
+        for text, idx in normed:
+            if "name" in text:
+                name_col = idx
                 break
+        return {
+            "name_col": name_col,
+            "no_col": no_col,
+            "check_col": check_col,
+            "validation_col": validation_col,
+        }
 
-    if last_rel_by_no is not None:
-        last_rel = last_rel_by_no
-    elif last_rel_by_any is not None:
-        last_rel = last_rel_by_any
-    else:
-        last_rel = last_rel_by_name if last_rel_by_name is not None else -1
-
-    true_end_rel_exclusive = last_rel + 1 if last_rel >= 0 else 0
-    true_end_abs_exclusive = content_start + true_end_rel_exclusive
-
-    section_df = df.iloc[content_start:true_end_abs_exclusive].copy().reset_index(drop=True)
-
-    name_series = section_df[name_col].astype(str).fillna("").apply(_to_space).str.strip()
-    excel_names = name_series.tolist()
-    xml_set     = {x.strip() for x in xml_names}
-
-    validation_vals = []
-    for nm in excel_names:
-        if not nm:
-            validation_vals.append("")
-        elif nm in xml_set:
-            validation_vals.append("Exists")
-        else:
-            validation_vals.append("Does not exist")
-
-    excel_set = {n for n in excel_names if n}
-    missing   = [n for n in xml_names if n not in excel_set]
-
-    fillable_rel = []
-    for i in range(section_df.shape[0]):
-        nm = _to_space(section_df.iat[i, name_col]).strip()
-        if nm != "":
-            continue
-        row = section_df.iloc[i]
-        has_no_num = (_extract_int(row[name_col*0 + no_col]) is not None) if (no_col is not None and no_col < len(row)) else False
-        has_other  = any((_to_space(row[j]).strip() != "" and j != name_col) for j in range(len(row)))
-        if has_no_num or has_other:
-            fillable_rel.append(i)
-
-    last_abs = content_start + (true_end_rel_exclusive - 1) if true_end_rel_exclusive > 0 else header_row_idx
-    insert_at_excel_row = last_abs + 2
-
-    if max_no is not None:
-        next_no = max_no + 1
-    else:
-        nonblank_names = sum(1 for v in excel_names if v)
-        next_no = nonblank_names + 1 if no_col is not None else None
-
-    return {
-        "label": label,
-        "header_row_idx": header_row_idx,
-        "content_start": content_start,
-        "content_end": true_end_abs_exclusive,
-        "name_col": name_col,
-        "validation_col": validation_col,
-        "no_col": no_col,
-        "check_col": check_col,
-        "header_excel_row": header_row_idx + 1,
-        "section_first_excel_row": content_start + 1,
-        "section_row_count": true_end_abs_exclusive - content_start,
-        "insert_at_excel_row": insert_at_excel_row,
-        "excel_names": excel_names,
-        "validation_vals": validation_vals,
-        "missing": missing,
-        "next_no": next_no,
-        "fillable_rel": fillable_rel,
-    }
-
-
-def plan_section_S(df: pd.DataFrame, xml_wq: Dict[str, Dict[str, Optional[str]]], verbose: bool = True) -> Optional[Dict[str, Any]]:
-    """
-    STRICT S detection and planning.
-    """
-    marker_row = find_S_marker_row(df, verbose=verbose)
-    if marker_row is None:
-        print("[S] Not detected; nothing will be written for S.")
-        return None
-
-    header_row = find_S_header_row(df, marker_row, verbose=verbose)
-    if header_row is None:
-        print("[S] Not detected (no header after marker); nothing will be written for S.")
-        return None
-
-    cols = pick_S_columns(df, header_row, verbose=verbose)
-    wq_name_col = cols["wq_name_col"]
-    key_col     = cols["key_col"]
-    no_col      = cols["no_col"]
-    check_col   = cols["check_col"]
-    validation_col = cols["validation_col"]
-
+    # work_queue
+    wq_name_col = None
+    for text, idx in normed:
+        if ("work" in text and "queue" in text and "name" in text):
+            wq_name_col = idx
+            break
     if wq_name_col is None:
-        print("[S] ❌ Could not identify 'Work Queue Name' column; aborting S write.")
-        return None
-
-    content_start = header_row + 1
-    content_end = len(df)  # until EOF (adjust if you have sections after S)
-
-    # Trim to last real row
-    coarse_df = df.iloc[content_start:content_end].copy().reset_index(drop=True)
-
-    last_rel_by_no = None
-    max_no = None
-    if no_col is not None and no_col < coarse_df.shape[1]:
-        for i in range(len(coarse_df)):
-            val = _extract_int(coarse_df.iat[i, no_col])
-            if val is not None:
-                max_no = val if (max_no is None or val > max_no) else max_no
-        for i in range(len(coarse_df) - 1, -1, -1):
-            val = _extract_int(coarse_df.iat[i, no_col])
-            if val is not None:
-                last_rel_by_no = i
+        for text, idx in normed:
+            if "name" in text and "key" not in text:
+                wq_name_col = idx
                 break
 
-    last_rel_by_any = None
-    for i in range(len(coarse_df) - 1, -1, -1):
-        if _row_has_any_nonblank(coarse_df.iloc[i]):
-            last_rel_by_any = i
+    key_col = None
+    for text, idx in normed:
+        if ("key" in text and "name" in text):
+            key_col = idx
             break
 
-    last_rel_by_name = None
-    if wq_name_col < coarse_df.shape[1]:
-        for i in range(len(coarse_df) - 1, -1, -1):
-            if _to_space(coarse_df.iat[i, wq_name_col]).strip() != "":
-                last_rel_by_name = i
-                break
-
-    if last_rel_by_no is not None:
-        last_rel = last_rel_by_no
-    elif last_rel_by_any is not None:
-        last_rel = last_rel_by_any
-    else:
-        last_rel = last_rel_by_name if last_rel_by_name is not None else -1
-
-    true_end_rel_exclusive = last_rel + 1 if last_rel >= 0 else 0
-    true_end_abs_exclusive = content_start + true_end_rel_exclusive
-
-    section_df = df.iloc[content_start:true_end_abs_exclusive].copy().reset_index(drop=True)
-
-    # Build validations
-    xml_names = list(xml_wq.keys())
-    xml_set   = set(xml_names)
-    name_series = section_df[wq_name_col].astype(str).fillna("").apply(_to_space).str.strip()
-    excel_names = name_series.tolist()
-
-    validation_vals = []
-    for nm in excel_names:
-        if not nm:
-            validation_vals.append("")
-        elif nm in xml_set:
-            validation_vals.append("Exists")
-        else:
-            validation_vals.append("Does not exist")
-
-    excel_set = {n for n in excel_names if n}
-    missing   = [n for n in xml_names if n not in excel_set]
-
-    # Fillable rows
-    fillable_rel = []
-    for i in range(section_df.shape[0]):
-        nm = _to_space(section_df.iat[i, wq_name_col]).strip()
-        if nm != "":
-            continue
-        row = section_df.iloc[i]
-        has_no_num = (_extract_int(row[wq_name_col*0 + no_col]) is not None) if (no_col is not None and no_col < len(row)) else False
-        has_other  = any((_to_space(row[j]).strip() != "" and j != wq_name_col) for j in range(len(row)))
-        if has_no_num or has_other:
-            fillable_rel.append(i)
-
-    last_abs = content_start + (true_end_rel_exclusive - 1) if true_end_rel_exclusive > 0 else header_row
-    insert_at_excel_row = last_abs + 2
-
-    if max_no is not None:
-        next_no = max_no + 1
-    else:
-        nonblank_names = sum(1 for v in excel_names if v)
-        next_no = nonblank_names + 1 if no_col is not None else None
-
-    print(f"[S] Content rows (trimmed) Excel {_excel_row(content_start)}..{_excel_row(true_end_abs_exclusive-1)}")
-    print(f"[S] XML WQ count={len(xml_names)}; existing rows={len(excel_names)}; missing from Excel={len(missing)}")
-    if missing:
-        print(f"[S] Missing (top few): {missing[:10]}")
+    enc_col = None
+    for text, idx in normed:
+        if "encrypted" in text:
+            enc_col = idx
+            break
 
     return {
-        "label": "Work Queues",
-        "marker_row_idx": marker_row,
-        "header_row_idx": header_row,
-        "content_start": content_start,
-        "content_end": true_end_abs_exclusive,
         "wq_name_col": wq_name_col,
         "key_col": key_col,
         "no_col": no_col,
+        "encrypted_col": enc_col,
         "check_col": check_col,
         "validation_col": validation_col,
-        "header_excel_row": header_row + 1,
-        "section_first_excel_row": content_start + 1,
-        "section_row_count": true_end_abs_exclusive - content_start,
+    }
+
+
+# ======================= planning per section =======================
+
+def build_plan_process_like(
+    df: pd.DataFrame,
+    header_row: int,
+    name_col: int,
+    no_col: Optional[int],
+    check_col: Optional[int],
+    validation_col: int,
+    xml_names: List[str],
+    next_marker_row: Optional[int],
+) -> Dict[str, Any]:
+    """Plan for Process/Business Object/Env(PROD) tables (Name, optional No./Check)."""
+    content_start = header_row + 1
+    content_end = next_marker_row if next_marker_row is not None else len(df)
+
+    coarse = df.iloc[content_start:content_end].copy().reset_index(drop=True)
+
+    # Find last relevant row
+    last_rel_by_no = None
+    max_no_value = None
+    if no_col is not None and no_col < coarse.shape[1]:
+        for row_index in range(len(coarse)):
+            v = _extract_int(coarse.iat[row_index, no_col])
+            if v is not None:
+                max_no_value = v if (max_no_value is None or v > max_no_value) else max_no_value
+        for row_index in range(len(coarse) - 1, -1, -1):
+            v = _extract_int(coarse.iat[row_index, no_col])
+            if v is not None:
+                last_rel_by_no = row_index
+                break
+
+    last_rel_by_any = None
+    for row_index in range(len(coarse) - 1, -1, -1):
+        if _row_has_any_nonblank(coarse.iloc[row_index]):
+            last_rel_by_any = row_index
+            break
+
+    last_rel_by_name = None
+    if name_col < coarse.shape[1]:
+        for row_index in range(len(coarse) - 1, -1, -1):
+            if _to_space(coarse.iat[row_index, name_col]).strip() != "":
+                last_rel_by_name = row_index
+                break
+
+    if last_rel_by_no is not None:
+        last_rel = last_rel_by_no
+    elif last_rel_by_any is not None:
+        last_rel = last_rel_by_any
+    else:
+        last_rel = last_rel_by_name if last_rel_by_name is not None else -1
+
+    true_end_rel_excl = last_rel + 1 if last_rel >= 0 else 0
+    true_end_abs_excl = content_start + true_end_rel_excl
+
+    section_df = df.iloc[content_start:true_end_abs_excl].copy().reset_index(drop=True)
+    row_names = section_df[name_col].astype(str).fillna("").apply(_to_space).str.strip().tolist()
+
+    # STRICT compare (trim-only; case-sensitive)
+    xml_set = {x.strip() for x in xml_names}
+
+    statuses: List[str] = []
+    for nm in row_names:
+        if not nm:
+            statuses.append("")
+        elif nm in xml_set:
+            statuses.append("Exists")
+        else:
+            statuses.append("Does not exist")
+
+    excel_set = {n for n in row_names if n}
+    missing = [n for n in xml_names if n not in excel_set]
+
+    fillable_rel: List[int] = []
+    for rel_index in range(section_df.shape[0]):
+        name_cell = _to_space(section_df.iat[rel_index, name_col]).strip()
+        if name_cell:
+            continue
+        row_values = section_df.iloc[rel_index]
+        has_number_in_no = (_extract_int(row_values[no_col]) is not None) if (no_col is not None and no_col < len(row_values)) else False
+        has_any_other_cell = any((_to_space(row_values[col_idx]).strip() != "" and col_idx != name_col)
+                                 for col_idx in range(len(row_values)))
+        if has_number_in_no or has_any_other_cell:
+            fillable_rel.append(rel_index)
+
+    last_abs_index = content_start + (true_end_rel_excl - 1) if true_end_rel_excl > 0 else header_row
+    insert_at_excel_row = last_abs_index + 2  # Excel is 1-based
+
+    if max_no_value is not None:
+        next_no = max_no_value + 1
+    else:
+        nonblank_names = sum(1 for v in row_names if v)
+        next_no = nonblank_names + 1 if no_col is not None else None
+
+    return {
+        "type": None,  # filled by caller
+        "header_row": header_row,              # 0-based (for sorting)
+        "header_excel_row": header_row + 1,    # 1-based (for writing header)
+        "start_row_excel": content_start + 1,  # 1-based first content row
+        "row_count": true_end_abs_excl - content_start,
         "insert_at_excel_row": insert_at_excel_row,
-        "excel_names": excel_names,
-        "validation_vals": validation_vals,
+        "name_col": name_col,
+        "no_col": no_col,
+        "check_col": check_col,
+        "validation_col": validation_col,
+        "excel_names": row_names,
+        "validation_vals": statuses,
         "missing": missing,
-        "next_no": next_no,
         "fillable_rel": fillable_rel,
+        "next_no": next_no,
         "inserted_rows": 0,
     }
 
 
-# =============== Write helpers for S ===============
+def build_plan_workqueue(
+    df: pd.DataFrame,
+    header_row: int,
+    cols: Dict[str, int],
+    xml_wq: Dict[str, Dict[str, Optional[str]]],
+    next_marker_row: Optional[int],
+) -> Dict[str, Any]:
+    """Plan for Work Queue table."""
+    wq_name_col = cols["wq_name_col"]
+    content_start = header_row + 1
+    content_end = next_marker_row if next_marker_row is not None else len(df)
 
-def _fill_into_existing_blanks_S(ws, plan: Dict[str, Any], names_to_place: List[str],
-                                 xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
+    coarse = df.iloc[content_start:content_end].copy().reset_index(drop=True)
+
+    # Find last relevant row
+    last_rel_by_no = None
+    max_no_value = None
+    if cols["no_col"] is not None and cols["no_col"] < coarse.shape[1]:
+        for row_index in range(len(coarse)):
+            v = _extract_int(coarse.iat[row_index, cols["no_col"]])
+            if v is not None:
+                max_no_value = v if (max_no_value is None or v > max_no_value) else max_no_value
+        for row_index in range(len(coarse) - 1, -1, -1):
+            v = _extract_int(coarse.iat[row_index, cols["no_col"]])
+            if v is not None:
+                last_rel_by_no = row_index
+                break
+
+    last_rel_by_any = None
+    for row_index in range(len(coarse) - 1, -1, -1):
+        if _row_has_any_nonblank(coarse.iloc[row_index]):
+            last_rel_by_any = row_index
+            break
+
+    last_rel_by_name = None
+    if wq_name_col < coarse.shape[1]:
+        for row_index in range(len(coarse) - 1, -1, -1):
+            if _to_space(coarse.iat[row_index, wq_name_col]).strip() != "":
+                last_rel_by_name = row_index
+                break
+
+    if last_rel_by_no is not None:
+        last_rel = last_rel_by_no
+    elif last_rel_by_any is not None:
+        last_rel = last_rel_by_any
+    else:
+        last_rel = last_rel_by_name if last_rel_by_name is not None else -1
+
+    true_end_rel_excl = last_rel + 1 if last_rel >= 0 else 0
+    true_end_abs_excl = content_start + true_end_rel_excl
+
+    section_df = df.iloc[content_start:true_end_abs_excl].copy().reset_index(drop=True)
+
+    xml_names = list(xml_wq.keys())
+    xml_set = set(xml_names)  # STRICT compare (case-sensitive after trim below)
+    row_names = section_df[wq_name_col].astype(str).fillna("").apply(_to_space).str.strip().tolist()
+
+    statuses: List[str] = []
+    for nm in row_names:
+        if not nm:
+            statuses.append("")
+        elif nm in xml_set:
+            statuses.append("Exists")
+        else:
+            statuses.append("Does not exist")
+
+    excel_set = {n for n in row_names if n}
+    missing = [n for n in xml_names if n not in excel_set]
+
+    fillable_rel: List[int] = []
+    for rel_index in range(section_df.shape[0]):
+        name_cell = _to_space(section_df.iat[rel_index, wq_name_col]).strip()
+        if name_cell:
+            continue
+        row_values = section_df.iloc[rel_index]
+        has_number_in_no = (_extract_int(row_values[cols["no_col"]]) is not None) if (cols["no_col"] is not None and cols["no_col"] < len(row_values)) else False
+        has_any_other_cell = any((_to_space(row_values[col_idx]).strip() != "" and col_idx != wq_name_col)
+                                 for col_idx in range(len(row_values)))
+        if has_number_in_no or has_any_other_cell:
+            fillable_rel.append(rel_index)
+
+    last_abs_index = content_start + (true_end_rel_excl - 1) if true_end_rel_excl > 0 else header_row
+    insert_at_excel_row = last_abs_index + 2
+
+    if max_no_value is not None:
+        next_no = max_no_value + 1
+    else:
+        nonblank_names = sum(1 for v in row_names if v)
+        next_no = nonblank_names + 1 if cols["no_col"] is not None else None
+
+    print(f"[WQ] Content rows Excel {_excel_row(content_start)}..{_excel_row(true_end_abs_excl-1)}; "
+          f"existing={len(row_names)}; missing_from_excel={len(missing)}")
+
+    return {
+        "type": None,  # filled by caller
+        "header_row": header_row,              # 0-based (for sorting)
+        "header_excel_row": header_row + 1,    # 1-based (for writing header)
+        "start_row_excel": content_start + 1,  # 1-based first content row
+        "row_count": true_end_abs_excl - content_start,
+        "insert_at_excel_row": insert_at_excel_row,
+        "wq_name_col": wq_name_col,
+        "key_col": cols["key_col"],
+        "no_col": cols["no_col"],
+        "check_col": cols["check_col"],
+        "validation_col": cols["validation_col"],
+        "excel_names": row_names,
+        "validation_vals": statuses,
+        "missing": missing,
+        "fillable_rel": fillable_rel,
+        "next_no": next_no,
+        "inserted_rows": 0,
+    }
+
+
+# ========================= writers per section =========================
+
+def write_existing_validation(ws, start_row_excel: int, validation_col0: int, statuses: List[str]) -> None:
+    validation_col_1based = validation_col0 + 1
+    for offset, status in enumerate(statuses):
+        row_1based = start_row_excel + offset
+        paste_formats_like_left(ws, row_1based, validation_col_1based)
+        ws.range((row_1based, validation_col_1based)).value = status if status else ""
+        if status == "Exists":
+            ws.range((row_1based, validation_col_1based)).color = COLOR_GREEN
+        elif status == "Does not exist":
+            ws.range((row_1based, validation_col_1based)).color = COLOR_RED
+        else:
+            ws.range((row_1based, validation_col_1based)).color = None
+        _apply_borders_like_left(ws, row_1based, validation_col_1based)
+
+
+def fill_into_blanks_name_table(ws, plan: Dict[str, Any], names_to_place: List[str]) -> int:
     consumed = 0
-    val_col_excel = plan["validation_col"] + 1
-    name_col_excel = plan["wq_name_col"] + 1
-    no_col_excel   = plan["no_col"] + 1 if plan["no_col"] is not None else None
-    check_col_excel= plan["check_col"] + 1 if plan["check_col"] is not None else None
-    key_col_excel  = plan["key_col"] + 1 if plan.get("key_col") is not None else None
-
+    name_col_1based = plan["name_col"] + 1
+    validation_col_1based = plan["validation_col"] + 1
+    no_col_1based = plan["no_col"] + 1 if plan["no_col"] is not None else None
+    check_col_1based = plan["check_col"] + 1 if plan["check_col"] is not None else None
     next_no = plan["next_no"]
 
-    for rel in plan["fillable_rel"]:
+    for rel_index in plan["fillable_rel"]:
         if consumed >= len(names_to_place):
             break
-        r = plan["section_first_excel_row"] + rel
+        row_1based = plan["start_row_excel"] + rel_index
+        new_name = names_to_place[consumed]
 
-        nm = names_to_place[consumed]
-        ws.range((r, name_col_excel)).value = nm
+        ws.range((row_1based, name_col_1based)).value = new_name
 
-        if key_col_excel is not None:
-            key_val = (xml_wq.get(nm, {}) or {}).get("key") or ""
-            if key_val:
-                ws.range((r, key_col_excel)).value = key_val
+        paste_formats_like_left(ws, row_1based, validation_col_1based)
+        ws.range((row_1based, validation_col_1based)).value = "Newly added"
+        ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+        _apply_borders_like_left(ws, row_1based, validation_col_1based)
 
-        paste_formats_like_left(ws, r, val_col_excel)
-        ws.range((r, val_col_excel)).value = "Newly added"
-        ws.range((r, val_col_excel)).color = COLOR_ORANGE
-        _apply_borders_like_left(ws, r, val_col_excel)
-
-        if no_col_excel is not None:
-            raw = str(ws.range((r, no_col_excel)).value or "").strip()
-            cur = _extract_int(raw)
-            if cur is None and next_no is not None:
-                ws.range((r, no_col_excel)).value = next_no
+        if no_col_1based is not None:
+            current_text = str(ws.range((row_1based, no_col_1based)).value or "")
+            current_no = _extract_int(current_text)
+            if current_no is None and next_no is not None:
+                ws.range((row_1based, no_col_1based)).value = next_no
                 next_no += 1
-            elif cur is not None and next_no is not None:
-                next_no = max(next_no, cur + 1)
+            elif current_no is not None and next_no is not None:
+                next_no = max(next_no, current_no + 1)
 
-        if check_col_excel is not None:
-            clear_fill_preserve_borders(ws, r, check_col_excel)
+        if check_col_1based is not None:
+            clear_fill_preserve_borders(ws, row_1based, check_col_1based)
 
         consumed += 1
 
@@ -837,85 +721,185 @@ def _fill_into_existing_blanks_S(ws, plan: Dict[str, Any], names_to_place: List[
     return consumed
 
 
-def _insert_new_rows_S(ws, plan: Dict[str, Any], remaining: List[str],
-                       xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
+def insert_new_rows_name_table(ws, plan: Dict[str, Any], remaining: List[str]) -> int:
     if not remaining:
         return 0
 
-    val_col_excel   = plan["validation_col"] + 1
-    name_col_excel  = plan["wq_name_col"] + 1
-    no_col_excel    = plan["no_col"] + 1 if plan["no_col"] is not None else None
-    check_col_excel = plan["check_col"] + 1 if plan["check_col"] is not None else None
-    key_col_excel   = plan["key_col"] + 1 if plan.get("key_col") is not None else None
-
+    name_col_1based = plan["name_col"] + 1
+    validation_col_1based = plan["validation_col"] + 1
+    no_col_1based = plan["no_col"] + 1 if plan["no_col"] is not None else None
+    check_col_1based = plan["check_col"] + 1 if plan["check_col"] is not None else None
     next_no = plan["next_no"]
 
-    for i, nm in enumerate(remaining):
-        r = plan["insert_at_excel_row"] + i
-        insert_row_with_style(ws, r)
-        ws.range((r, name_col_excel)).value = nm
+    for offset, new_name in enumerate(remaining):
+        row_1based = plan["insert_at_excel_row"] + offset
+        insert_row_with_style(ws, row_1based)
+        ws.range((row_1based, name_col_1based)).value = new_name
 
-        if key_col_excel is not None:
-            key_val = (xml_wq.get(nm, {}) or {}).get("key") or ""
-            if key_val:
-                ws.range((r, key_col_excel)).value = key_val
+        paste_formats_like_left(ws, row_1based, validation_col_1based)
+        ws.range((row_1based, validation_col_1based)).value = "Newly added"
+        ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+        _apply_borders_like_left(ws, row_1based, validation_col_1based)
 
-        paste_formats_like_left(ws, r, val_col_excel)
-        ws.range((r, val_col_excel)).value = "Newly added"
-        ws.range((r, val_col_excel)).color = COLOR_ORANGE
-        _apply_borders_like_left(ws, r, val_col_excel)
-
-        if no_col_excel is not None and next_no is not None:
-            ws.range((r, no_col_excel)).value = next_no
+        if no_col_1based is not None and next_no is not None:
+            ws.range((row_1based, no_col_1based)).value = next_no
             next_no += 1
 
-        if check_col_excel is not None:
-            clear_fill_preserve_borders(ws, r, check_col_excel)
+        if check_col_1based is not None:
+            clear_fill_preserve_borders(ws, row_1based, check_col_1based)
 
     plan["next_no"] = next_no
     plan["inserted_rows"] = (plan.get("inserted_rows", 0) or 0) + len(remaining)
     return len(remaining)
 
 
-def _adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
-    key_col = plan.get("key_col")
-    if key_col is None:
+def fill_into_blanks_wq(ws, plan: Dict[str, Any], names_to_place: List[str], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
+    consumed = 0
+    name_col_1based = plan["wq_name_col"] + 1
+    key_col_1based = plan["key_col"] + 1 if plan.get("key_col") is not None else None
+    validation_col_1based = plan["validation_col"] + 1
+    no_col_1based = plan["no_col"] + 1 if plan["no_col"] is not None else None
+    check_col_1based = plan["check_col"] + 1 if plan["check_col"] is not None else None
+    next_no = plan["next_no"]
+
+    for rel_index in plan["fillable_rel"]:
+        if consumed >= len(names_to_place):
+            break
+        row_1based = plan["start_row_excel"] + rel_index
+        new_name = names_to_place[consumed]
+
+        ws.range((row_1based, name_col_1based)).value = new_name
+        if key_col_1based is not None:
+            key_val = (xml_wq.get(new_name, {}) or {}).get("key") or ""
+            if key_val:
+                ws.range((row_1based, key_col_1based)).value = key_val
+
+        paste_formats_like_left(ws, row_1based, validation_col_1based)
+        ws.range((row_1based, validation_col_1based)).value = "Newly added"
+        ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+        _apply_borders_like_left(ws, row_1based, validation_col_1based)
+
+        if no_col_1based is not None:
+            current_text = str(ws.range((row_1based, no_col_1based)).value or "")
+            current_no = _extract_int(current_text)
+            if current_no is None and next_no is not None:
+                ws.range((row_1based, no_col_1based)).value = next_no
+                next_no += 1
+            elif current_no is not None and next_no is not None:
+                next_no = max(next_no, current_no + 1)
+
+        if check_col_1based is not None:
+            clear_fill_preserve_borders(ws, row_1based, check_col_1based)
+
+        consumed += 1
+
+    plan["next_no"] = next_no
+    return consumed
+
+
+def insert_new_rows_wq(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
+    if not remaining:
         return 0
 
-    name_col_excel = plan["wq_name_col"] + 1
-    key_col_excel  = key_col + 1
-    val_col_excel  = plan["validation_col"] + 1
+    name_col_1based = plan["wq_name_col"] + 1
+    key_col_1based = plan["key_col"] + 1 if plan.get("key_col") is not None else None
+    validation_col_1based = plan["validation_col"] + 1
+    no_col_1based = plan["no_col"] + 1 if plan["no_col"] is not None else None
+    check_col_1based = plan["check_col"] + 1 if plan["check_col"] is not None else None
+    next_no = plan["next_no"]
 
-    total_rows_to_check = plan["section_row_count"] + (plan.get("inserted_rows", 0) or 0)
+    for offset, new_name in enumerate(remaining):
+        row_1based = plan["insert_at_excel_row"] + offset
+        insert_row_with_style(ws, row_1based)
+        ws.range((row_1based, name_col_1based)).value = new_name
+
+        if key_col_1based is not None:
+            key_val = (xml_wq.get(new_name, {}) or {}).get("key") or ""
+            if key_val:
+                ws.range((row_1based, key_col_1based)).value = key_val
+
+        paste_formats_like_left(ws, row_1based, validation_col_1based)
+        ws.range((row_1based, validation_col_1based)).value = "Newly added"
+        ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+        _apply_borders_like_left(ws, row_1based, validation_col_1based)
+
+        if no_col_1based is not None and next_no is not None:
+            ws.range((row_1based, no_col_1based)).value = next_no
+            next_no += 1
+
+        if check_col_1based is not None:
+            clear_fill_preserve_borders(ws, row_1based, check_col_1based)
+
+    plan["next_no"] = next_no
+    plan["inserted_rows"] = (plan.get("inserted_rows", 0) or 0) + len(remaining)
+    return len(remaining)
+
+
+def adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
+    if plan.get("key_col") is None:
+        return 0
+    name_col_1based = plan["wq_name_col"] + 1
+    key_col_1based = plan["key_col"] + 1
+    validation_col_1based = plan["validation_col"] + 1
+
+    total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
     mismatches = 0
-
-    for i in range(total_rows_to_check):
-        r = plan["section_first_excel_row"] + i
-        nm  = (_to_space(ws.range((r, name_col_excel)).value).strip())
-        if not nm or nm not in xml_wq:
+    for offset in range(total_rows):
+        row_1based = plan["start_row_excel"] + offset
+        nm = _to_space(ws.range((row_1based, name_col_1based)).value).strip()
+        if not nm or nm not in xml_wq:  # STRICT name
             continue
-
-        expected_key = (_to_space(xml_wq[nm].get("key") or "").strip())
-        if not expected_key:
+        expected = _to_space(xml_wq[nm].get("key") or "").strip()
+        if not expected:
             continue
-
-        excel_key = (_to_space(ws.range((r, key_col_excel)).value).strip())
-
-        if excel_key.casefold() != expected_key.casefold():
-            current = (_to_space(ws.range((r, val_col_excel)).value).strip())
-            if current.lower().startswith("exists"):
-                ws.range((r, val_col_excel)).value = f'Exists (Key mismatch: expected "{expected_key}")'
-            elif current.lower().startswith("newly added"):
-                ws.range((r, val_col_excel)).value = f'Newly added (Key mismatch: expected "{expected_key}")'
-            ws.range((r, val_col_excel)).color = COLOR_ORANGE
+        excel_key = _to_space(ws.range((row_1based, key_col_1based)).value).strip()
+        if excel_key != expected:       # STRICT key
+            current = _to_space(ws.range((row_1based, validation_col_1based)).value).strip()
+            if current.startswith("Exists"):
+                ws.range((row_1based, validation_col_1based)).value = f'Exists (Key mismatch: expected "{expected}")'
+            elif current.startswith("Newly added"):
+                ws.range((row_1based, validation_col_1based)).value = f'Newly added (Key mismatch: expected "{expected}")'
+            ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
             mismatches += 1
-
     return mismatches
 
 
-# =============== Main workflow ===============
+# ---------- ENV(PROD): post-write validator to catch local Data items ----------
+
+def adjust_env_local_validation(ws, plan: Dict[str, Any], local_data_item_names: List[str]) -> int:
+    """
+    For Environment Variable (PROD):
+      If a Name also exists as a local Data stage in the release, annotate the
+      validation cell and color orange.
+    """
+    local_set = set(local_data_item_names)
+    name_col_1based = plan["name_col"] + 1
+    validation_col_1based = plan["validation_col"] + 1
+
+    total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
+    hits = 0
+    for offset in range(total_rows):
+        row_1based = plan["start_row_excel"] + offset
+        env_name = _to_space(ws.range((row_1based, name_col_1based)).value).strip()
+        if not env_name:
+            continue
+        if env_name in local_set:
+            current = _to_space(ws.range((row_1based, validation_col_1based)).value).strip()
+            if current.startswith("Exists"):
+                ws.range((row_1based, validation_col_1based)).value = "Exists (Also defined locally)"
+            elif current.startswith("Newly added"):
+                ws.range((row_1based, validation_col_1based)).value = "Newly added (Also defined locally)"
+            else:
+                ws.range((row_1based, validation_col_1based)).value = "Also defined locally"
+            ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+            hits += 1
+    return hits
+
+
+# ============================ main flow ============================
 
 _ILLEGAL_SHEET_CHARS = r'[:\\/?*\[\]]'
+
 
 def _sanitize_sheet_name(name: str) -> str:
     name = re.sub(_ILLEGAL_SHEET_CHARS, "_", name).strip()
@@ -924,14 +908,14 @@ def _sanitize_sheet_name(name: str) -> str:
 
 def _unique_sheet_name(wb, base: str) -> str:
     base = _sanitize_sheet_name(base)
-    names = [s.name for s in wb.sheets]
+    taken = [s.name for s in wb.sheets]
     name = base
-    i = 2
-    while name in names:
-        suffix = f" ({i})"
+    counter = 2
+    while name in taken:
+        suffix = f" ({counter})"
         keep = 31 - len(suffix)
         name = _sanitize_sheet_name(base[:max(1, keep)] + suffix)
-        i += 1
+        counter += 1
     return name
 
 
@@ -941,54 +925,94 @@ def _sheet_by_name_or_index(wb, sheet_arg):
     return wb.sheets[str(sheet_arg)]
 
 
-def validate_and_write(
+def validate_and_write_dynamic(
     excel_path: str,
     sheet_arg,
-    xml_process_names: List[str],
-    xml_object_names: List[str],
-    xml_work_queues: Dict[str, Dict[str, Optional[str]]],
-    verbose_S: bool = True,
+    xml_proc: List[str],
+    xml_bo: List[str],
+    xml_wq: Dict[str, Dict[str, Optional[str]]],
+    xml_env_prod: List[str],                     # ENV(PROD)
+    xml_local_data_names: List[str],             # ENV(PROD) local guard
 ) -> None:
-    sheet_arg_for_pd = int(sheet_arg) if (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()) else sheet_arg
-    df = pd.read_excel(excel_path, sheet_name=sheet_arg_for_pd, header=None, dtype=str, engine='openpyxl').fillna('')
 
-    # A and B (unchanged)
-    next_for_A = [["B.", "Business Object"]]
-    next_for_B = [
-        ["C.", "Environment Variables"], ["C", "Environment Variables"],
-        ["C.", "environment", "variable"],
-        ["D.", "environment", "variable"], ["D", "environment", "variable"],
-        ["E.", "Startup Parameters"], ["E", "Startup Parameters"],
-        ["S.", "work", "queue"], ["S", "work", "queue"],  # stop B at S if present
-    ]
+    # Read for planning (strings, no header)
+    sheet_arg_pd = int(sheet_arg) if (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()) else sheet_arg
+    df = pd.read_excel(excel_path, sheet_name=sheet_arg_pd, header=None, dtype=str, engine="openpyxl").fillna("")
 
-    plan_A = plan_section_AB(df, ["A.", "Process"], xml_process_names, label="Process",
-                             header_keyword="name", next_section_groups=next_for_A)
-    plan_B = plan_section_AB(df, ["B.", "Business Object"], xml_object_names, label="Business Object",
-                             header_keyword="name", next_section_groups=next_for_B)
-    plan_S = plan_section_S(df, xml_work_queues, verbose=verbose_S)
-
-    if plan_A is None and plan_B is None and plan_S is None:
-        print("⛔ Stopping: A, B, S not detected.")
+    # 1) Detect markers
+    markers = find_dynamic_markers(df)
+    if not markers:
+        print("⛔ No section letter markers found. Nothing to do.")
         return
 
+    # 2) Build plans per marker, bounded by the next marker (or EOF)
+    plans: List[Dict[str, Any]] = []
+    for marker_index, marker in enumerate(markers):
+        marker_row = marker["row"]
+        marker_type = marker["type"]
+
+        next_marker_row: Optional[int] = markers[marker_index + 1]["row"] if marker_index + 1 < len(markers) else None
+
+        if marker_type == "unknown":
+            # Boundary only; skip processing
+            continue
+
+        header_row = find_header_after_marker(df, marker_row, marker_type, lookahead=80)
+        if header_row is None:
+            print(f"[{marker_type}] ❌ Could not find a header row after marker at Excel row {_excel_row(marker_row)}. Skipping.")
+            continue
+
+        # 20-row rule: if next marker is far away, treat as last to EOF
+        if next_marker_row is not None and next_marker_row - header_row > 20:
+            print(f"[{marker_type}] Next marker is {next_marker_row - header_row} rows away (>20). Treating as last to EOF.")
+            next_marker_row = None
+
+        columns = pick_columns(df, header_row, marker_type)
+
+        if marker_type in ("process", "business_object", "environment_variable_prod"):
+            if columns["name_col"] is None:
+                print(f"[{marker_type}] ❌ Could not resolve a 'Name' column at header Excel row {_excel_row(header_row)}.")
+                continue
+            plan = build_plan_process_like(
+                df, header_row, columns["name_col"], columns["no_col"], columns["check_col"],
+                columns["validation_col"],
+                xml_proc if marker_type == "process"
+                else xml_bo if marker_type == "business_object"
+                else xml_env_prod,  # ENV(PROD)
+                next_marker_row=next_marker_row
+            )
+        else:  # work_queue
+            if columns["wq_name_col"] is None or columns["key_col"] is None:
+                print(f"[work_queue] ❌ Need both 'Work Queue Name' and 'Key Name' columns. Skipping.")
+                continue
+            plan = build_plan_workqueue(df, header_row, columns, xml_wq, next_marker_row=next_marker_row)
+
+        plan["type"] = marker_type
+        plan["header_row"] = header_row
+        plans.append(plan)
+
+    if not plans:
+        print("⛔ No valid sections planned. Nothing to write.")
+        return
+
+    # 3) Open Excel; clone sheet; write in visual order (top to bottom)
     app = xw.App(visible=False, add_book=False)
     try:
         wb = app.books.open(str(excel_path))
-        src_sht = _sheet_by_name_or_index(wb, sheet_arg)
+        src_sheet = _sheet_by_name_or_index(wb, sheet_arg)
 
         try:
             app.api.EnableEvents = False
         except Exception:
             pass
 
-        before = [s.name for s in wb.sheets]
-        src_sht.api.Copy(After=src_sht.api)
-        after = [s.name for s in wb.sheets]
-        added = [n for n in after if n not in before]
+        before_names = [s.name for s in wb.sheets]
+        src_sheet.api.Copy(After=src_sheet.api)
+        after_names = [s.name for s in wb.sheets]
+        added = [n for n in after_names if n not in before_names]
         ws = wb.sheets[added[0]] if len(added) == 1 else wb.sheets[-1]
 
-        new_name = _unique_sheet_name(wb, f"{src_sht.name}_validated")
+        new_name = _unique_sheet_name(wb, f"{src_sheet.name}_validated")
         try:
             ws.name = new_name
         except Exception as e:
@@ -996,71 +1020,52 @@ def validate_and_write(
 
         placements = snapshot_and_set_placement(ws)
 
-        rows_inserted_A = 0
-        rows_inserted_B = 0
+        # Sort by on-sheet order and accumulate inserted rows to offset subsequent plans
+        plans.sort(key=lambda p: p["header_row"])
 
-        # ----- A -----
-        if plan_A is not None:
-            print("▶ A. Process")
-            val_col_excel = plan_A["validation_col"] + 1
-            paste_formats_like_left(ws, plan_A["header_excel_row"], val_col_excel)
-            ws.range((plan_A["header_excel_row"], val_col_excel)).value = "Validation"
-            _apply_borders_like_left(ws, plan_A["header_excel_row"], val_col_excel)
+        total_inserted_above = 0
+        for section_index, plan in enumerate(plans):
 
-            _write_existing_validation(ws, plan_A["section_first_excel_row"], plan_A["validation_col"], plan_A["validation_vals"])
+            # shift *1-based* fields by rows inserted above
+            for key_name in ("start_row_excel", "insert_at_excel_row", "header_excel_row"):
+                if key_name in plan and isinstance(plan[key_name], int):
+                    plan[key_name] += total_inserted_above
 
-            # fill / insert
-            rows_inserted_A = 0  # using your original generic helpers would go here, omitted to keep focus on S
+            # write "Validation" on the header row (column headers)
+            validation_col_1based = plan["validation_col"] + 1
+            paste_formats_like_left(ws, plan["header_excel_row"], validation_col_1based)
+            ws.range((plan["header_excel_row"], validation_col_1based)).value = "Validation"
+            _apply_borders_like_left(ws, plan["header_excel_row"], validation_col_1based)
+
+            # existing rows' validation
+            write_existing_validation(ws, plan["start_row_excel"], plan["validation_col"], plan["validation_vals"])
+
+            # fill blanks first, then insert any remaining
+            rows_added_here = 0
+            if plan["type"] in ("process", "business_object", "environment_variable_prod"):
+                consumed_count = fill_into_blanks_name_table(ws, plan, plan["missing"])
+                remaining_names = plan["missing"][consumed_count:]
+                rows_added_here = insert_new_rows_name_table(ws, plan, remaining_names)
+
+                # ENV(PROD) local-variable guard
+                if plan["type"] == "environment_variable_prod":
+                    local_hits = adjust_env_local_validation(ws, plan, xml_local_data_names)
+                    if local_hits:
+                        print(f"[env_prod] {local_hits} name(s) are also defined locally (Data items).")
+            else:
+                consumed_count = fill_into_blanks_wq(ws, plan, plan["missing"], xml_wq)
+                remaining_names = plan["missing"][consumed_count:]
+                rows_added_here = insert_new_rows_wq(ws, plan, remaining_names, xml_wq)
+                mismatch_count = adjust_wq_key_validation(ws, plan, xml_wq)
+                print(f"[work_queue] filled={consumed_count}, inserted={rows_added_here}, key_mismatches={mismatch_count}")
+
+            total_inserted_above += rows_added_here
+
+            # Autofit Validation column
             try:
-                ws.api.Columns(val_col_excel).AutoFit()
+                ws.api.Columns(validation_col_1based).AutoFit()
             except Exception:
                 pass
-
-        # ----- B -----
-        if plan_B is not None:
-            print("▶ B. Business Object")
-            if plan_A is not None and plan_B["header_row_idx"] > plan_A["header_row_idx"]:
-                # would offset here if we inserted rows in A
-                pass
-
-            val_col_excel = plan_B["validation_col"] + 1
-            paste_formats_like_left(ws, plan_B["header_excel_row"], val_col_excel)
-            ws.range((plan_B["header_excel_row"], val_col_excel)).value = "Validation"
-            _apply_borders_like_left(ws, plan_B["header_excel_row"], val_col_excel)
-
-            _write_existing_validation(ws, plan_B["section_first_excel_row"], plan_B["validation_col"], plan_B["validation_vals"])
-
-            rows_inserted_B = 0  # focus on S
-            try:
-                ws.api.Columns(val_col_excel).AutoFit()
-            except Exception:
-                pass
-
-        # ----- S -----
-        if plan_S is not None:
-            print("▶ S. Work Queues")
-            val_col_excel = plan_S["validation_col"] + 1
-            paste_formats_like_left(ws, plan_S["header_excel_row"], val_col_excel)
-            ws.range((plan_S["header_excel_row"], val_col_excel)).value = "Validation"
-            _apply_borders_like_left(ws, plan_S["header_excel_row"], val_col_excel)
-
-            # Existing rows' validation
-            _write_existing_validation(ws, plan_S["section_first_excel_row"], plan_S["validation_col"], plan_S["validation_vals"])
-
-            # Fill blanks first, then insert remainders
-            consumed = _fill_into_existing_blanks_S(ws, plan_S, plan_S["missing"], xml_work_queues)
-            remaining = plan_S["missing"][consumed:]
-            inserted = _insert_new_rows_S(ws, plan_S, remaining, xml_work_queues)
-
-            # Key check
-            mismatches = _adjust_wq_key_validation(ws, plan_S, xml_work_queues)
-
-            try:
-                ws.api.Columns(val_col_excel).AutoFit()
-            except Exception:
-                pass
-
-            print(f"[S] Summary: filled={consumed}, inserted={inserted}, key_mismatches={mismatches}")
 
         restore_placement(ws, placements)
         wb.save()
@@ -1077,32 +1082,44 @@ def validate_and_write(
         app.quit()
 
 
-# =============== CLI ===============
+# =============================== CLI ===============================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate A/B/S sections against a Blue Prism release XML (S uses strict same-row marker)."
+        description="Validate Process / Business Object / Work Queue / Environment Variable (PROD) sections against a Blue Prism release XML (dynamic markers)."
     )
-    parser.add_argument('--xml', required=True, help="Path to Blue Prism .bprelease XML")
-    parser.add_argument('--excel', required=True, help="Path to Excel file (.xlsx/.xlsm)")
-    parser.add_argument('--sheet', default="0", help="Sheet name or 0-based index (default: 0)")
-    parser.add_argument('--quietS', action='store_true', help="Suppress verbose S detection logs")
+    parser.add_argument("--xml", required=True, help="Path to Blue Prism .bprelease XML")
+    parser.add_argument("--excel", required=True, help="Path to Excel file (.xlsx/.xlsm)")
+    parser.add_argument("--sheet", default="0", help="Sheet name or 0-based index (default: 0)")
     args = parser.parse_args()
 
     print("🔍 Parsing XML…")
-    xml_process_names = extract_names_from_xml(args.xml, "process")
-    xml_object_names  = extract_names_from_xml(args.xml, "object")
-    xml_work_queues   = extract_work_queues_from_xml(args.xml)
-    print(f"✅ Found {len(xml_process_names)} process; {len(xml_object_names)} objects; {len(xml_work_queues)} work queues.")
+    xml_proc = extract_names_from_xml(args.xml, "process")
+    xml_bo = extract_names_from_xml(args.xml, "object")
+    xml_wq = {}  # keep your previous extractor if you need WQ; left blank here to focus on ENV(PROD)
+    # If you still use Work Queues from earlier version, swap in your extract_work_queues_from_xml(...)
+    try:
+        from __main__ import extract_work_queues_from_xml as _maybe_wq
+        xml_wq = _maybe_wq(args.xml)
+    except Exception:
+        xml_wq = {}
+
+    # ENV(PROD): environment variables and local Data items
+    xml_env_prod = extract_env_variables_from_xml(args.xml)
+    xml_local_data_names = extract_local_data_item_names(args.xml)
+
+    print(f"✅ XML: processes={len(xml_proc)}, business_objects={len(xml_bo)}, "
+          f"work_queues={len(xml_wq)}, env_prod={len(xml_env_prod)}, local_data_items={len(xml_local_data_names)}")
 
     print("🧪 Validating & writing…")
-    validate_and_write(
+    validate_and_write_dynamic(
         excel_path=args.excel,
         sheet_arg=args.sheet,
-        xml_process_names=xml_process_names,
-        xml_object_names=xml_object_names,
-        xml_work_queues=xml_work_queues,
-        verbose_S=not args.quietS,
+        xml_proc=xml_proc,
+        xml_bo=xml_bo,
+        xml_wq=xml_wq,
+        xml_env_prod=xml_env_prod,
+        xml_local_data_names=xml_local_data_names,
     )
 
 
