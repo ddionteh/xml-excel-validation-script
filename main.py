@@ -2,28 +2,35 @@
 """
 Validate Excel sections against a Blue Prism release XML (dynamic sections).
 
-Adds support for:
-- Environment Variable (PROD): verifies every env var from XML is present in Excel,
-  and flags if any of those names are also defined as a local Data item in the release.
-- BP Scripts Check: finds the row with "Is your main process published?" and writes a
-  single Validation cell based on the first <process ... published="..."> value in XML.
+What's new in this version
+--------------------------
+- Process section now shows THREE new columns (to the left of 'Validation'):
+    1) Published status         <- literal <process published="..."> value
+    2) Hard coded values        <- placeholder for future logic
+    3) Exception Types          <- comma-joined types from <exception type="...">
+       * If any type is not 'System Exception' or 'Business Exception', the cell
+         becomes: "Found unknown exception types: <list>"
 
-Core behavior kept:
-- Dynamic section detection via same-row single-letter marker (A..Z with optional '.' or ':')
-  + keyword. Unknown sections still act as boundaries.
-- Dot-insensitive for markers and 'No.' header; case-insensitive for headers;
-  STRICT (trim-only, case-sensitive) for values (names, keys).
-- Header row is the row *after* marker; "Validation" written on that row.
-- 20-row rule: if next marker is >20 rows after header, treat as last (to EOF).
-- Preserves formats/merges/embedded objects when inserting.
+- BP Scripts Check stays: still sets the single row "Is your main process published?"
+  using the FIRST <process> published attribute.
+- ENV vars are sourced from:
+    (A) Data stages with <exposure>Environment</exposure> (preferred)
+    (B) Fallback blocks named "Environment Variables" / "Environmnet Variables".
+  When the fallback block is found, we print a structure dump of its child stages.
+
+- Dynamic sections via same-row single-letter marker + keyword, unknowns still bound.
+- STRICT value checks (trim-only, case-sensitive). Headers case-insensitive.
+- We keep shapes/OLE/Chart objects moving with inserted rows by temporarily
+  setting .Placement to xlMove, then restoring the original values.
 
 Requires: pandas, xlwings, openpyxl
 """
 
 import argparse
+import csv
 import re
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 
 import pandas as pd
 import xlwings as xw
@@ -54,59 +61,60 @@ def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
     return out
 
 
-# ---------- ENV(PROD) XML extractors ----------
-def extract_env_variables_from_xml(xml_path: str) -> List[str]:
+def get_process_metadata(xml_path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Return process metadata mapping:
+      {
+        "<process name>": {
+            "published": "True"/"False"/None,
+            "exception_types": set([...])   # gathered from <exception type="..."> inside that process
+        },
+        ...
+      }
+    """
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    names = []
+    meta: Dict[str, Dict[str, Any]] = {}
 
-    # Canonical form
-    for elem in root.iter():
-        if _local(elem.tag) == "environment-variable":
-            nm = elem.attrib.get("name")
-            if nm:
-                names.append(nm.strip())
-
-    # Fallback: container stages named "Environment Variables" / misspelt
-    if not names:
-        targets = set(("environment variables", "environmnet variables"))
-        for stage in root.iter():
-            if _local(stage.tag) != "stage":
-                continue
-            if (stage.attrib.get("name") or "").strip().lower() in targets:
-                for sub in stage.iter():
-                    if _local(sub.tag) == "stage":
-                        nm = (sub.attrib.get("name") or "").strip()
-                        if nm and nm.lower() not in targets:
-                            names.append(nm)
-
-    # any Data stage explicitly exposed as Environment
-    for stage in root.iter():
-        if _local(stage.tag) != "stage":
+    for proc in root.iter():
+        if _local(proc.tag) != "process":
             continue
-        if (stage.attrib.get("type") or "").strip().lower() == "data":
-            name_attr = stage.attrib.get("name")
-            if not name_attr:
-                continue
-            exposure = None
-            for child in stage:
-                if _local(child.tag) == "exposure":
-                    exposure = (child.text or "").strip().lower()
-                    break
-            if exposure == "environment":
-                names.append(name_attr.strip())
+        name = (proc.attrib.get("name") or "").strip()
+        if not name:
+            # unnamed process? skip but continue scanning
+            continue
+        published = proc.attrib.get("published")
+        published = published.strip() if isinstance(published, str) else None
 
-    # de-dupe preserving order
-    seen, out = set(), []
-    for n in names:
-        if n not in seen:
-            seen.add(n); out.append(n)
-    return out
+        types: Set[str] = set()
+        for elem in proc.iter():
+            if _local(elem.tag) == "exception":
+                t = elem.attrib.get("type")
+                if t:
+                    types.add(t.strip())
 
-def extract_local_data_item_names(xml_path: str) -> List[str]:
+        meta[name] = {"published": published, "exception_types": types}
+
+    return meta
+
+
+# ---------- Environment variables via exposure / block ----------
+
+def extract_env_variables_from_xml(xml_path: str) -> List[str]:
+    """
+    Return ordered unique list of ENV VAR NAMES for your releases (no <environment-variable>):
+      - Data stages with <exposure>Environment</exposure>  (PREFERRED)
+      - Fallback: child <stage> names under a container/stage named
+                  "Environment Variables" or "Environmnet Variables".
+      When the fallback block is found, prints a structure dump of its children
+      including each child's exposure (if any).
+    """
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    locals_only = []
+
+    names: List[str] = []
+
+    # Preferred: Data stage with exposure=Environment
     for stage in root.iter():
         if _local(stage.tag) != "stage":
             continue
@@ -120,7 +128,66 @@ def extract_local_data_item_names(xml_path: str) -> List[str]:
             if _local(child.tag) == "exposure":
                 exposure = (child.text or "").strip().lower()
                 break
-        if exposure != "environment":   # <- local (not env)
+        if exposure == "environment":
+            names.append(name_attr.strip())
+
+    # Fallback: "Environment Variables" container/block
+    targets = {"environment variables", "environmnet variables"}
+    for stage in root.iter():
+        if _local(stage.tag) != "stage":
+            continue
+        stage_name = (stage.attrib.get("name") or "").strip()
+        if stage_name.casefold() in targets:
+            # --- Structure dump for debug ---
+            print(f"[env_debug] Found block '{stage_name}' (type={stage.attrib.get('type')})")
+            child_count = 0
+            for sub in stage:
+                if _local(sub.tag) != "stage":
+                    continue
+                child_count += 1
+                sub_name = (sub.attrib.get("name") or sub.attrib.get("Name") or "").strip()
+                sub_type = (sub.attrib.get("type") or "").strip()
+                # look for exposure under child
+                exposure = None
+                for gg in sub:
+                    if _local(gg.tag) == "exposure":
+                        exposure = (gg.text or "").strip()
+                        break
+                print(f"  - child stage: name='{sub_name}', type='{sub_type}', exposure='{exposure or ''}'")
+                if sub_name and sub_name.casefold() not in targets:
+                    names.append(sub_name)
+            print(f"[env_debug] Block children counted: {child_count}")
+
+    # de-dupe preserving order
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n); out.append(n)
+    return out
+
+
+def extract_local_data_item_names(xml_path: str) -> List[str]:
+    """
+    Return local Data item names (i.e., NOT exposure='Environment').
+    Used to flag ENV vars that collide with local data items.
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    locals_only: List[str] = []
+    for stage in root.iter():
+        if _local(stage.tag) != "stage":
+            continue
+        if (stage.attrib.get("type") or "").strip().lower() != "data":
+            continue
+        name_attr = stage.attrib.get("name") or stage.attrib.get("Name")
+        if not name_attr:
+            continue
+        exposure = None
+        for child in stage:
+            if _local(child.tag) == "exposure":
+                exposure = (child.text or "").strip().lower()
+                break
+        if exposure != "environment":   # local (not env)
             locals_only.append(name_attr.strip())
 
     # de-dupe preserving order
@@ -147,10 +214,78 @@ def get_first_process_published(xml_path: str) -> Tuple[Optional[str], Optional[
     return None, None
 
 
+# ---------- Hardcoded literal finder (heuristic) ----------
+
+_TEXTY_TAGS = {
+    "initialvalue", "expression", "text", "sql", "note", "url", "path", "filename", "address", "value"
+}
+_TEXTY_ATTRS = {
+    "value", "expression", "text", "sql", "url", "address", "path", "filename",
+    "server", "database", "username", "password"
+}
+
+def _looks_hardcoded(val: str, min_len: int = 3) -> bool:
+    t = re.sub(r"\s+", " ", (val or "")).strip()
+    if not t:
+        return False
+    low = t.casefold()
+    if low in {"true", "false", "yes", "no", "null", "none"}:
+        return False
+    if re.fullmatch(r"\[[^\]]+\]", t):                    # [Data Item] refs
+        return False
+    if re.fullmatch(r"[-+]?\d+(\.\d+)?", t):              # pure number
+        return False
+    if any(len(q.strip()) >= min_len for q in re.findall(r'"([^"]+)"', t)):
+        return True
+    if "://" in t or re.search(r"[\\/]|\w+@\w+", t):      # URLs/paths/emails
+        return True
+    if len(t) >= max(8, min_len) and re.search(r"[A-Za-z]", t) and re.search(r"\d", t):
+        return True
+    if len(t) >= min_len and " " in t and not re.fullmatch(r"[A-Za-z0-9_ ]+", t):
+        return True
+    return len(t) >= 20
+
+def find_hardcoded_literals(xml_path: str, min_len: int = 3) -> List[Dict[str, str]]:
+    """
+    Heuristically find hardcoded literals in common fields/tags/attrs.
+    Returns dicts with keys: where, tag_or_attr, value.
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    parent_map = {c: p for p in root.iter() for c in p}
+
+    def _context(elem: ET.Element) -> str:
+        p = elem
+        while p is not None:
+            if _local(p.tag) == "stage":
+                typ = p.attrib.get("type") or "?"
+                nm = p.attrib.get("name") or p.attrib.get("Name") or "?"
+                return f"Stage:{typ}/{nm}"
+            p = parent_map.get(p)
+        p = elem
+        while p is not None:
+            loc = _local(p.tag)
+            if loc in {"process", "object"}:
+                nm = p.attrib.get("name") or "?"
+                return f"{loc.capitalize()}:{nm}"
+            p = parent_map.get(p)
+        return _local(elem.tag)
+
+    hits: List[Dict[str, str]] = []
+    for elem in root.iter():
+        loc = _local(elem.tag)
+        txt = (elem.text or "").strip()
+        if txt and loc.lower() in _TEXTY_TAGS and _looks_hardcoded(txt, min_len=min_len):
+            hits.append({"where": _context(elem), "tag_or_attr": f"<{loc}>", "value": txt})
+        for an, av in list(elem.attrib.items()):
+            if an.lower() in _TEXTY_ATTRS and av and _looks_hardcoded(av, min_len=min_len):
+                hits.append({"where": _context(elem), "tag_or_attr": f"@{an}", "value": av})
+    return hits
+
+
 # ==================== normalization / tokens ====================
 
 NBSPS = ("\u00A0", "\u2007", "\u202F")
-
 
 def _to_space(value) -> str:
     if value is None:
@@ -162,13 +297,10 @@ def _to_space(value) -> str:
     text = re.sub(r"\s+", " ", text)
     return text
 
-
 def _norm(value) -> str:
     return _to_space(value).strip().casefold()
 
-
 def _cell_is_single_letter_marker(cell_val: str) -> bool:
-    """True if cell is exactly A..Z (any case) with optional trailing '.' or ':'."""
     v = _norm(cell_val)
     if not v:
         return False
@@ -178,14 +310,11 @@ def _cell_is_single_letter_marker(cell_val: str) -> bool:
         return True
     return False
 
-
 def _row_tokens(row: pd.Series) -> List[str]:
     return [_norm(c) for c in row]
 
-
 def _excel_row(idx0: int) -> int:
     return idx0 + 1
-
 
 def _excel_col_letter(col0: int) -> str:
     col = col0 + 1
@@ -194,7 +323,6 @@ def _excel_col_letter(col0: int) -> str:
         col, rem = divmod(col - 1, 26)
         label = chr(65 + rem) + label
     return label
-
 
 def _dump_row(row_index: int, row: pd.Series, max_cols: int = 20) -> str:
     parts = []
@@ -205,10 +333,9 @@ def _dump_row(row_index: int, row: pd.Series, max_cols: int = 20) -> str:
 
 # ===================== formatting / borders =====================
 
-COLOR_GREEN = (198, 239, 206)   # Exists / OK
+COLOR_GREEN = (198, 239, 206)   # OK / Exists
 COLOR_RED   = (255, 199, 206)   # Not OK
 COLOR_ORANGE= (255, 235, 156)   # Newly added / Attention
-
 
 def _clone_borders(from_cell_api, to_cell_api) -> None:
     for border_id in (7, 8, 9, 10, 11, 12):
@@ -226,7 +353,6 @@ def _clone_borders(from_cell_api, to_cell_api) -> None:
     except Exception:
         pass
 
-
 def _apply_borders_like_left(ws, row_1based: int, col_1based: int) -> None:
     if col_1based <= 1:
         return
@@ -236,7 +362,6 @@ def _apply_borders_like_left(ws, row_1based: int, col_1based: int) -> None:
         _clone_borders(left, dst)
     except Exception:
         pass
-
 
 def paste_formats_like_left(ws, row_1based: int, col_1based: int) -> None:
     if col_1based <= 1:
@@ -248,7 +373,6 @@ def paste_formats_like_left(ws, row_1based: int, col_1based: int) -> None:
     except Exception:
         pass
 
-
 def clear_fill_preserve_borders(ws, row_1based: int, col_1based: int) -> None:
     try:
         dst = ws.api.Cells(row_1based, col_1based)
@@ -259,7 +383,6 @@ def clear_fill_preserve_borders(ws, row_1based: int, col_1based: int) -> None:
             _clone_borders(ws.api.Cells(row_1based - 1, col_1based), dst)
     except Exception:
         pass
-
 
 def insert_row_with_style(ws, row_1based: int) -> None:
     ws.api.Rows(row_1based).Insert(Shift=-4121, CopyOrigin=0)  # down
@@ -301,11 +424,9 @@ def _last_nonempty_col_index(row: pd.Series) -> int:
             last_index = col_index
     return last_index
 
-
 def _extract_int(text: str) -> Optional[int]:
     match = re.search(r"\d+", _to_space(text))
     return int(match.group(0)) if match else None
-
 
 def _row_has_any_nonblank(series: pd.Series) -> bool:
     return any(_to_space(v).strip() != "" for v in list(series.values))
@@ -317,7 +438,7 @@ SECTION_REGISTRY = {
     "process":                   {"keyword": "process"},
     "business_object":           {"keyword": "business object"},
     "work_queue":                {"keyword": "work queue"},
-    "bp_scripts_check":          {"keyword": "bp scripts check"},      # <--- NEW
+    "bp_scripts_check":          {"keyword": "bp scripts check"},
     # ENV(PROD)
     "environment_variable_prod": {"keyword": "environment variables (prod)"},
 }
@@ -560,10 +681,10 @@ def build_plan_process_like(
         next_no = nonblank_names + 1 if no_col is not None else None
 
     return {
-        "type": None,  # filled by caller
-        "header_row": header_row,              # 0-based (for sorting)
-        "header_excel_row": header_row + 1,    # 1-based (for writing header)
-        "start_row_excel": content_start + 1,  # 1-based first content row
+        "type": None,
+        "header_row": header_row,
+        "header_excel_row": header_row + 1,
+        "start_row_excel": content_start + 1,
         "row_count": true_end_abs_excl - content_start,
         "insert_at_excel_row": insert_at_excel_row,
         "name_col": name_col,
@@ -633,7 +754,7 @@ def build_plan_workqueue(
     section_df = df.iloc[content_start:true_end_abs_excl].copy().reset_index(drop=True)
 
     xml_names = list(xml_wq.keys())
-    xml_set = set(xml_names)  # STRICT compare (case-sensitive after trim below)
+    xml_set = set(xml_names)  # STRICT compare
     row_names = section_df[wq_name_col].astype(str).fillna("").apply(_to_space).str.strip().tolist()
 
     statuses: List[str] = []
@@ -669,15 +790,15 @@ def build_plan_workqueue(
         nonblank_names = sum(1 for v in row_names if v)
         next_no = nonblank_names + 1 if cols["no_col"] is not None else None
 
-    print(f"[WQ] Content rows Excel {_excel_row(content_start)}..{_excel_row(true_end_abs_excl-1)}; "
+    print(f"[WQ] Content rows Excel {_excel_row(content_start)}..{_excel_row(true_end_rel_excl and (content_start + true_end_rel_excl - 1) or content_start)}; "
           f"existing={len(row_names)}; missing_from_excel={len(missing)}")
 
     return {
-        "type": None,  # filled by caller
-        "header_row": header_row,              # 0-based (for sorting)
-        "header_excel_row": header_row + 1,    # 1-based (for writing header)
-        "start_row_excel": content_start + 1,  # 1-based first content row
-        "row_count": true_end_abs_excl - content_start,
+        "type": None,
+        "header_row": header_row,
+        "header_excel_row": header_row + 1,
+        "start_row_excel": content_start + 1,
+        "row_count": true_end_rel_excl - 0 + 0,  # equal to (true_end_abs_excl - content_start)
         "insert_at_excel_row": insert_at_excel_row,
         "wq_name_col": wq_name_col,
         "key_col": cols["key_col"],
@@ -700,10 +821,10 @@ def build_plan_bp_scripts_check(
     next_marker_row: Optional[int],
 ) -> Dict[str, Any]:
     """
-    Build a plan for the 'BP Scripts Check' section:
-      - header is first nonblank row after the marker (already resolved upstream)
-      - scan any column for the exact target phrase (case/space-normalized)
-      - only that one row gets a Validation value
+    'BP Scripts Check' section plan:
+      - header is first nonblank row after the marker
+      - scan ANY column for EXACT "Is your main process published?" (normalized)
+      - only that row gets a Validation value
     """
     content_start = header_row + 1
     content_end = next_marker_row if next_marker_row is not None else len(df)
@@ -719,14 +840,14 @@ def build_plan_bp_scripts_check(
             break
 
     return {
-        "type": None,  # filled by caller
+        "type": None,
         "header_row": header_row,
         "header_excel_row": header_row + 1,
         "start_row_excel": content_start + 1,
         "row_count": section_df.shape[0],
         "validation_col": cols["validation_col"],
         "target_row_rel": target_rel,
-        "validation_vals": [""] * section_df.shape[0],  # bulk writer is skipped for this section
+        "validation_vals": [""] * section_df.shape[0],
         "inserted_rows": 0,
     }
 
@@ -919,7 +1040,7 @@ def adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[st
         if not expected:
             continue
         excel_key = _to_space(ws.range((row_1based, key_col_1based)).value).strip()
-        if excel_key != expected:       # STRICT key
+        if excel_key != expected:
             current = _to_space(ws.range((row_1based, validation_col_1based)).value).strip()
             if current.startswith("Exists"):
                 ws.range((row_1based, validation_col_1based)).value = f'Exists (Key mismatch: expected "{expected}")'
@@ -934,7 +1055,7 @@ def adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[st
 
 def adjust_env_local_validation(ws, plan: Dict[str, Any], local_data_item_names: List[str]) -> int:
     """
-    For Environment Variable (PROD):
+    For Environment Variables (PROD):
       If a Name also exists as a local Data stage in the release, annotate the
       validation cell and color orange.
     """
@@ -989,26 +1110,162 @@ def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], published_text: 
     _apply_borders_like_left(ws, row_1based, validation_col_1based)
 
 
+# ---------- Process extras (Published/Hardcoded/Exception Types) ----------
+
+_ALLOWED_EXC = {"System Exception", "Business Exception"}
+
+def _ensure_process_extra_columns_in_plan(plan: Dict[str, Any]) -> None:
+    """
+    For 'process' sections, reserve 3 columns immediately to the left of Validation.
+    We don't physically insert columns; we reuse the slot where 'Validation' would go,
+    place the three headers there, and shift 'Validation' three columns to the right.
+    """
+    base = plan["validation_col"]
+    plan["published_col"] = base
+    plan["hardcoded_col"] = base + 1
+    plan["exception_col"] = base + 2
+    plan["validation_col"] = base + 3  # shift validation right by 3
+
+
+def _write_process_extra_headers(ws, plan: Dict[str, Any]) -> None:
+    row = plan["header_excel_row"]
+    # Published
+    c1 = plan["published_col"] + 1
+    paste_formats_like_left(ws, row, c1)
+    ws.range((row, c1)).value = "Published status"
+    _apply_borders_like_left(ws, row, c1)
+
+    # Hard coded values (placeholder)
+    c2 = plan["hardcoded_col"] + 1
+    paste_formats_like_left(ws, row, c2)
+    ws.range((row, c2)).value = "Hard coded values"
+    _apply_borders_like_left(ws, row, c2)
+
+    # Exception Types
+    c3 = plan["exception_col"] + 1
+    paste_formats_like_left(ws, row, c3)
+    ws.range((row, c3)).value = "Exception Types"
+    _apply_borders_like_left(ws, row, c3)
+
+
+def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Fill 'Published status', 'Hard coded values' (blank for now), and 'Exception Types'
+    for every row in the Process table (existing + inserted).
+    """
+    name_col_1 = plan["name_col"] + 1
+    pub_col_1  = plan["published_col"] + 1
+    hard_col_1 = plan["hardcoded_col"] + 1
+    exc_col_1  = plan["exception_col"] + 1
+
+    total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
+    for offset in range(total_rows):
+        row = plan["start_row_excel"] + offset
+        nm = _to_space(ws.range((row, name_col_1)).value).strip()
+        # blank out by default
+        for col1 in (pub_col_1, hard_col_1, exc_col_1):
+            paste_formats_like_left(ws, row, col1)
+            ws.range((row, col1)).value = ""
+            _apply_borders_like_left(ws, row, col1)
+
+        if not nm:
+            continue
+
+        meta = proc_meta.get(nm, {})
+
+        # Published status: literal text
+        pub = meta.get("published")
+        if pub is not None:
+            ws.range((row, pub_col_1)).value = pub
+
+        # Hard coded values: (placeholder) leave empty for now
+
+        # Exception types:
+        types = set(meta.get("exception_types") or [])
+        if types:
+            unknown = [t for t in sorted(types) if t not in _ALLOWED_EXC]
+            if unknown:
+                ws.range((row, exc_col_1)).value = f"Found unknown exception types: {', '.join(unknown)}"
+            else:
+                ws.range((row, exc_col_1)).value = ", ".join(sorted(types))
+
+
 # ============================ placement helpers ============================
 
-def snapshot_and_set_placement(ws):
-    # No-op placeholder (kept for compatibility)
-    return None
+XL_MOVE_AND_SIZE = 1
+XL_MOVE          = 2
+XL_FREE_FLOATING = 3
 
-def restore_placement(ws, placements):
-    # No-op placeholder (kept for compatibility)
-    pass
+def _iter_shapes_with_placement(ws):
+    """Yield (kind, name, obj) for items that expose .Placement."""
+    try:
+        shapes = ws.api.Shapes
+        count = int(shapes.Count)
+        for i in range(1, count + 1):
+            shp = shapes.Item(i)
+            name = str(getattr(shp, "Name", f"Shape{i}"))
+            yield ("Shape", name, shp)
+    except Exception:
+        pass
+
+    try:
+        charts = ws.api.ChartObjects()
+        count = int(charts.Count)
+        for i in range(1, count + 1):
+            co = charts.Item(i)
+            name = str(getattr(co, "Name", f"Chart{i}"))
+            yield ("ChartObject", name, co)
+    except Exception:
+        pass
+
+    try:
+        oles = ws.api.OLEObjects()
+        count = int(oles.Count)
+        for i in range(1, count + 1):
+            ole = oles.Item(i)
+            name = str(getattr(ole, "Name", f"OLE{i}"))
+            yield ("OLEObject", name, ole)
+    except Exception:
+        pass
+
+
+def snapshot_and_set_placement(ws):
+    """Capture each object's .Placement and set to xlMove (move with cells, don't size)."""
+    snapshots = []
+    for kind, name, obj in _iter_shapes_with_placement(ws):
+        try:
+            placement = int(obj.Placement)
+        except Exception:
+            continue
+        snapshots.append({"kind": kind, "name": name, "placement": placement})
+        try:
+            obj.Placement = XL_MOVE
+        except Exception:
+            pass
+    return snapshots
+
+
+def restore_placement(ws, snapshots):
+    """Restore each object's original .Placement."""
+    if not snapshots:
+        return
+    lookup = {(s["kind"], s["name"]): s["placement"] for s in snapshots}
+    for kind, name, obj in _iter_shapes_with_placement(ws):
+        key = (kind, name)
+        if key in lookup:
+            try:
+                obj.Placement = int(lookup[key])
+            except Exception:
+                pass
 
 
 # ============================ main flow ============================
 
 _ILLEGAL_SHEET_CHARS = r'[:\\/?*\[\]]'
 
-
 def _sanitize_sheet_name(name: str) -> str:
     name = re.sub(_ILLEGAL_SHEET_CHARS, "_", name).strip()
     return (name[:31] or "Sheet")
-
 
 def _unique_sheet_name(wb, base: str) -> str:
     base = _sanitize_sheet_name(base)
@@ -1022,7 +1279,6 @@ def _unique_sheet_name(wb, base: str) -> str:
         counter += 1
     return name
 
-
 def _sheet_by_name_or_index(wb, sheet_arg):
     if isinstance(sheet_arg, int) or (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()):
         return wb.sheets[int(sheet_arg)]
@@ -1035,9 +1291,10 @@ def validate_and_write_dynamic(
     xml_proc: List[str],
     xml_bo: List[str],
     xml_wq: Dict[str, Dict[str, Optional[str]]],
-    xml_env_prod: List[str],                     # ENV(PROD)
-    xml_local_data_names: List[str],             # ENV(PROD) local guard
+    xml_env_prod: List[str],                     # ENV via exposure/block
+    xml_local_data_names: List[str],             # local guard
     first_process_published_text: Optional[str], # BP Scripts Check
+    proc_meta: Dict[str, Dict[str, Any]],        # NEW: per-process metadata
 ) -> None:
 
     # Read for planning (strings, no header)
@@ -1059,7 +1316,6 @@ def validate_and_write_dynamic(
         next_marker_row: Optional[int] = markers[marker_index + 1]["row"] if marker_index + 1 < len(markers) else None
 
         if marker_type == "unknown":
-            # Boundary only; skip processing
             continue
 
         header_row = find_header_after_marker(df, marker_row, marker_type, lookahead=80)
@@ -1067,7 +1323,7 @@ def validate_and_write_dynamic(
             print(f"[{marker_type}] ❌ Could not find a header row after marker at Excel row {_excel_row(marker_row)}. Skipping.")
             continue
 
-        # 20-row rule: if next marker is far away, treat as last to EOF
+        # 20-row rule
         if next_marker_row is not None and next_marker_row - header_row > 20:
             print(f"[{marker_type}] Next marker is {next_marker_row - header_row} rows away (>20). Treating as last to EOF.")
             next_marker_row = None
@@ -1083,7 +1339,7 @@ def validate_and_write_dynamic(
                 columns["validation_col"],
                 xml_proc if marker_type == "process"
                 else xml_bo if marker_type == "business_object"
-                else xml_env_prod,  # ENV(PROD)
+                else xml_env_prod,  # ENV via exposure/block
                 next_marker_row=next_marker_row
             )
         elif marker_type == "bp_scripts_check":
@@ -1102,7 +1358,7 @@ def validate_and_write_dynamic(
         print("⛔ No valid sections planned. Nothing to write.")
         return
 
-    # 3) Open Excel; clone sheet; write in visual order (top to bottom)
+    # 3) Open Excel; clone sheet; manage object placement; write
     app = xw.App(visible=False, add_book=False)
     try:
         wb = app.books.open(str(excel_path))
@@ -1132,11 +1388,15 @@ def validate_and_write_dynamic(
 
         total_inserted_above = 0
         for section_index, plan in enumerate(plans):
-
             # shift *1-based* fields by rows inserted above
             for key_name in ("start_row_excel", "insert_at_excel_row", "header_excel_row"):
                 if key_name in plan and isinstance(plan[key_name], int):
                     plan[key_name] += total_inserted_above
+
+            # If this is the Process section, reserve the 3 columns before Validation
+            if plan["type"] == "process":
+                _ensure_process_extra_columns_in_plan(plan)
+                _write_process_extra_headers(ws, plan)
 
             # write "Validation" on the header row (column headers)
             validation_col_1based = plan["validation_col"] + 1
@@ -1155,15 +1415,18 @@ def validate_and_write_dynamic(
                 remaining_names = plan["missing"][consumed_count:]
                 rows_added_here = insert_new_rows_name_table(ws, plan, remaining_names)
 
-                # ENV(PROD) local-variable guard
+                # ENV local-variable guard
                 if plan["type"] == "environment_variable_prod":
                     local_hits = adjust_env_local_validation(ws, plan, xml_local_data_names)
                     if local_hits:
                         print(f"[env_prod] {local_hits} name(s) are also defined locally (Data items).")
 
+                # Process extras after rows are finalized
+                if plan["type"] == "process":
+                    write_process_extras(ws, plan, proc_meta)
+
             elif plan["type"] == "bp_scripts_check":
                 write_bp_scripts_check_validation(ws, plan, first_process_published_text)
-                rows_added_here = 0
 
             else:  # work_queue
                 consumed_count = fill_into_blanks_wq(ws, plan, plan["missing"], xml_wq)
@@ -1199,34 +1462,56 @@ def validate_and_write_dynamic(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate sections (Process/Business Object/Work Queue/Env Var (PROD)/BP Scripts Check) against a Blue Prism release XML (dynamic markers)."
+        description="Validate sections (Process/Business Object/Work Queue/Environment Variables (PROD)/BP Scripts Check) against a Blue Prism release XML (dynamic markers)."
     )
     parser.add_argument("--xml", required=True, help="Path to Blue Prism .bprelease XML")
     parser.add_argument("--excel", required=True, help="Path to Excel file (.xlsx/.xlsm)")
     parser.add_argument("--sheet", default="0", help="Sheet name or 0-based index (default: 0)")
+    parser.add_argument("--hardcoded-csv", default=None, help="Optional path to write a CSV report of detected hardcoded literals")
     args = parser.parse_args()
 
     print("🔍 Parsing XML…")
     xml_proc = extract_names_from_xml(args.xml, "process")
     xml_bo = extract_names_from_xml(args.xml, "object")
-    xml_wq = {}  # keep your previous extractor if you need WQ; left blank here to focus on ENV(PROD) + BP Scripts Check
-    # If you still use Work Queues from earlier version, swap in your extract_work_queues_from_xml(...)
+    xml_wq = {}
     try:
         from __main__ import extract_work_queues_from_xml as _maybe_wq
         xml_wq = _maybe_wq(args.xml)
     except Exception:
         xml_wq = {}
 
-    # ENV(PROD): environment variables and local Data items
+    # ENV(PROD): via exposure / block + local Data items
     xml_env_prod = extract_env_variables_from_xml(args.xml)
     xml_local_data_names = extract_local_data_item_names(args.xml)
+
+    # Process metadata (published + exception types)
+    proc_meta = get_process_metadata(args.xml)
 
     # First process's published attribute (used in BP Scripts Check)
     first_proc_name, first_proc_published = get_first_process_published(args.xml)
 
+    # Console summary
     print(f"✅ XML: processes={len(xml_proc)}, business_objects={len(xml_bo)}, "
-          f"work_queues={len(xml_wq)}, env_prod={len(xml_env_prod)}, local_data_items={len(xml_local_data_names)}")
+          f"work_queues={len(xml_wq)}, env_vars={len(xml_env_prod)}, local_data_items={len(xml_local_data_names)}")
     print(f"ℹ️ Main process assumed = first <process>: '{first_proc_name or 'N/A'}', published={first_proc_published or 'N/A'}")
+    # Also show a quick published/exception summary (first 5)
+    if proc_meta:
+        print("ℹ️ Example processes metadata (first 5):")
+        for i, (pn, md) in enumerate(proc_meta.items()):
+            if i >= 5:
+                break
+            print(f"   - {pn}: published={md.get('published')}, exceptions={sorted(md.get('exception_types') or [])}")
+
+    # Optional: hardcoded literal scan/report
+    if args.hardcoded_csv is not None:
+        hits = find_hardcoded_literals(args.xml, min_len=3)
+        print(f"🔎 Hardcoded literal candidates: {len(hits)}")
+        with open(args.hardcoded_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["where", "tag_or_attr", "value"])
+            w.writeheader()
+            for h in hits:
+                w.writerow(h)
+        print(f"📄 Wrote hardcoded-literals report to: {args.hardcoded_csv}")
 
     print("🧪 Validating & writing…")
     validate_and_write_dynamic(
@@ -1238,6 +1523,7 @@ def main():
         xml_env_prod=xml_env_prod,
         xml_local_data_names=xml_local_data_names,
         first_process_published_text=first_proc_published,
+        proc_meta=proc_meta,
     )
 
 
