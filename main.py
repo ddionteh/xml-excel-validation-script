@@ -10,22 +10,23 @@ Key points
     3) Exception Types
   (then writes Validation to the right)
 
-- Published status: writes literal <process published="...">. If Excel's name
-  casing differs, we fall back to case-insensitive matching.
+- Published status: writes the process's published value. Robust reader:
+  prefers <process published="..."> (any case), else falls back to child
+  elements like <published>true</published> / <is-published>true</is-published>.
 
 - Exception Types: only values CONTAINING "Exception". Allowed:
   "System Exception", "Business Exception". Others flagged as
   "Found unknown exception types: …". If none contain "Exception", leave blank.
 
 - BP Scripts Check: "Is your main process published?" is YES only if
-  every process that HAS a published attribute has published="True" (case-insensitive).
+  every process that HAS a published value evaluates to True (case-insensitive).
 
 - Environment Variables (PROD): via Data stages with <exposure>Environment</exposure>
   (preferred) + fallback “Environment Variables” / “Environmnet Variables” block,
   with a structure dump for inspection.
 
-- Work Queue header detection: phrase “Work Queue Name” (and “Key Name”), not
-  split-word matching.
+- Work Queue header detection: phrase “Work Queue Name” (and “Key Name”),
+  not split-word matching.
 
 - Prevents vertical merge bleed: unmerges vertically-merged cells in each section
   before writing, and unmerges any target cell before setting a value.
@@ -57,10 +58,11 @@ def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
     root = tree.getroot()
     names: List[str] = []
     for elem in root.iter():
-        if _local(elem.tag) == want:
-            name_attr = elem.attrib.get('name')
+        if _local(elem.tag).casefold() == want.casefold():   # <- case-insensitive
+            name_attr = elem.attrib.get('name') or elem.attrib.get('Name')
             if name_attr:
                 names.append(name_attr.strip())
+    # ordered de-dupe
     seen = set()
     out: List[str] = []
     for name in names:
@@ -69,32 +71,77 @@ def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
     return out
 
 
+def _read_published_value(proc_elem: ET.Element) -> Optional[str]:
+    """
+    Prefer <process published="..."> (any case), else fall back to child nodes:
+      <published>...</published>, <is-published>...</is-published>, <ispublished>...</ispublished>
+    Return the literal string found (normalized to 'True'/'False' for common booleans), else None.
+    """
+    # 1) attribute (accept different casings)
+    for attr_name in ("published", "Published", "PUBLISHED"):
+        if attr_name in proc_elem.attrib:
+            raw = (proc_elem.attrib.get(attr_name) or "").strip()
+            break
+    else:
+        raw = None
+
+    # 2) child nodes if attribute missing/empty
+    if not raw:
+        for child in proc_elem.iter():
+            tag = _local(child.tag).casefold()
+            if tag in {"published", "is-published", "ispublished"}:
+                raw = (child.text or "").strip()
+                if raw:
+                    break
+
+    if not raw:
+        return None
+
+    # normalize common boolean strings but keep a readable literal
+    low = raw.casefold()
+    if low in {"true", "1", "yes", "y"}:
+        return "True"
+    if low in {"false", "0", "no", "n"}:
+        return "False"
+    return raw  # unusual literal e.g. "TRUE " or "t" — keep as-is
+
 def get_process_metadata(xml_path: str) -> Dict[str, Dict[str, Any]]:
     """
     Returns:
-      { "<process name>": {"published": "True"/"False"/None, "exception_types": set([...])}, ...}
+      { "<process name>": {"published": "True"/"False"/<literal>/None, "exception_types": set([...])}, ...}
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()
     meta: Dict[str, Dict[str, Any]] = {}
 
     for proc in root.iter():
-        if _local(proc.tag) != "process":
+        if _local(proc.tag).casefold() != "process":   # <- case-insensitive
             continue
-        name = (proc.attrib.get("name") or "").strip()
+        name = (proc.attrib.get("name") or proc.attrib.get("Name") or "").strip()
         if not name:
             continue
-        published = proc.attrib.get("published")
-        published = published.strip() if isinstance(published, str) else None
+
+        published = _read_published_value(proc)
 
         types: Set[str] = set()
         for elem in proc.iter():
-            if _local(elem.tag) == "exception":
+            if _local(elem.tag).casefold() == "exception":   # <- case-insensitive
                 t = elem.attrib.get("type")
                 if t:
                     types.add(t.strip())
 
-        meta[name] = {"published": published, "exception_types": types}
+        # Merge with existing entry without losing a real published value
+        if name in meta:
+            prev = meta[name]
+            keep_pub = prev.get("published")
+            if keep_pub is None and published is not None:
+                keep_pub = published  # only upgrade None -> real value
+            meta[name] = {
+                "published": keep_pub,
+                "exception_types": (prev.get("exception_types") or set()) | types,
+            }
+        else:
+            meta[name] = {"published": published, "exception_types": types}
 
     return meta
 
@@ -210,18 +257,6 @@ def extract_local_data_item_names(xml_path: str) -> List[str]:
         if n not in seen:
             seen.add(n); out.append(n)
     return out
-
-
-def get_first_process_published(xml_path: str) -> Tuple[Optional[str], Optional[str]]:
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    for elem in root.iter():
-        if _local(elem.tag) == "process":
-            name = (elem.attrib.get("name") or "").strip() or None
-            published = elem.attrib.get("published")
-            pub_str = (published.strip() if isinstance(published, str) else None)
-            return name, pub_str
-    return None, None
 
 
 # ---------- Hardcoded literal finder (heuristic, optional) ----------
@@ -1309,7 +1344,7 @@ def _all_processes_published(proc_meta: Dict[str, Dict[str, Any]]) -> bool:
             failing.append((name or "(unnamed)", pub))
 
     if not found_any:
-        print("[BP Scripts Check] No processes have a 'published' attribute; treating aggregate as False.")
+        print("[BP Scripts Check] No processes have a 'published' value; treating aggregate as False.")
         return False
 
     if failing:
@@ -1546,12 +1581,10 @@ def main():
     xml_local_data_names = extract_local_data_item_names(args.xml)
 
     proc_meta = get_process_metadata(args.xml)
-    first_proc_name, first_proc_published = get_first_process_published(args.xml)
     all_published = _all_processes_published(proc_meta)
 
     print(f"✅ XML: processes={len(xml_proc)}, business_objects={len(xml_bo)}, "
           f"work_queues={len(xml_wq)}, env_vars={len(xml_env_prod)}, local_data_items={len(xml_local_data_names)}")
-    print(f"ℹ️ First <process>: '{first_proc_name or 'N/A'}', published={first_proc_published or 'N/A'}")
     print(f"ℹ️ BP Scripts Check aggregate — ALL processes published: {all_published}")
 
     if args.hardcoded_csv is not None:
