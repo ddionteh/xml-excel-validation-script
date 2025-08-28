@@ -1362,7 +1362,6 @@ def validate_and_write_dynamic(
     xml_wq: Dict[str, Dict[str, Optional[str]]],
     xml_env_prod: List[str],                     # ENV(PROD)
     xml_local_data_names: List[str],             # ENV(PROD) local guard
-    first_process_published_text: Optional[str], # (unused here if you aggregate later)
     proc_meta: Optional[Dict[str, Dict[str, Any]]] = None,  # contains per-process published/exception info if you pass it
     all_procs_published_bool: Optional[bool] = None,        # aggregate used by BP Scripts Check writer
 ) -> None:
@@ -1494,7 +1493,7 @@ def validate_and_write_dynamic(
 
                     # Process extras after rows are finalized
                     if plan["type"] == "process":
-                        write_process_extras(ws, plan, proc_meta)
+                        write_process_extras(ws, plan, proc_meta or {})
 
                 elif plan["type"] == "bp_scripts_check":
                     bp_plans.append(plan)  # defer to end
@@ -1504,7 +1503,7 @@ def validate_and_write_dynamic(
                     remaining_names = plan["missing"][consumed_count:]
                     rows_added_here = insert_new_rows_wq(ws, plan, remaining_names, xml_wq)
 
-                    # (#5) uses the *batched* adjust_wq_key_validation implementation you added earlier
+                    # batched key validation
                     mismatch_count = adjust_wq_key_validation(ws, plan, xml_wq)
                     print(f"[work_queue] filled={consumed_count}, inserted={rows_added_here}, key_mismatches={mismatch_count}")
 
@@ -1552,7 +1551,7 @@ def validate_and_write_dynamic(
 
             # Now write BP Scripts Check results using the aggregate
             for plan in bp_plans:
-                write_bp_scripts_check_validation(ws, plan, all_procs_published_bool)
+                write_bp_scripts_check_validation(ws, plan, bool(all_procs_published_bool))
 
             restore_placement(ws, placements)
             wb.save()
