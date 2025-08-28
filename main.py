@@ -4,24 +4,29 @@ Validate Excel sections against a Blue Prism release XML (dynamic sections).
 
 What's new in this version
 --------------------------
-- Process section now shows THREE new columns (to the left of 'Validation'):
+- Process section shows THREE new columns (to the left of 'Validation'):
     1) Published status         <- literal <process published="..."> value
     2) Hard coded values        <- placeholder for future logic
-    3) Exception Types          <- comma-joined types from <exception type="...">
-       * If any type is not 'System Exception' or 'Business Exception', the cell
-         becomes: "Found unknown exception types: <list>"
+    3) Exception Types          <- from <exception type="..."> that CONTAINS "Exception"
+       * Allowed: "System Exception", "Business Exception" (comma-joined)
+       * Other types like "Foo Exception" are flagged as:
+         "Found unknown exception types: Foo Exception"
+       * If NO types contain "Exception", cell is BLANK.
 
-- BP Scripts Check stays: still sets the single row "Is your main process published?"
-  using the FIRST <process> published attribute.
-- ENV vars are sourced from:
-    (A) Data stages with <exposure>Environment</exposure> (preferred)
+- BP Scripts Check:
+    "Is your main process published?" is YES only if ALL processes
+    have published="True". Otherwise NO.
+
+- ENV vars (Environment Variables (PROD)) via:
+    (A) Data stages with <exposure>Environment</exposure>  (preferred)
     (B) Fallback blocks named "Environment Variables" / "Environmnet Variables".
-  When the fallback block is found, we print a structure dump of its child stages.
+  When the fallback block is found, we print a structure dump of child stages
+  (name, type, exposure) for inspection.
 
-- Dynamic sections via same-row single-letter marker + keyword, unknowns still bound.
+- Dynamic sections via same-row single-letter marker + keyword; unknowns still bound.
 - STRICT value checks (trim-only, case-sensitive). Headers case-insensitive.
 - We keep shapes/OLE/Chart objects moving with inserted rows by temporarily
-  setting .Placement to xlMove, then restoring the original values.
+  setting .Placement to xlMove, then restoring originals.
 
 Requires: pandas, xlwings, openpyxl
 """
@@ -67,7 +72,7 @@ def get_process_metadata(xml_path: str) -> Dict[str, Dict[str, Any]]:
       {
         "<process name>": {
             "published": "True"/"False"/None,
-            "exception_types": set([...])   # gathered from <exception type="..."> inside that process
+            "exception_types": set([...])   # all raw types under that process
         },
         ...
       }
@@ -81,7 +86,6 @@ def get_process_metadata(xml_path: str) -> Dict[str, Dict[str, Any]]:
             continue
         name = (proc.attrib.get("name") or "").strip()
         if not name:
-            # unnamed process? skip but continue scanning
             continue
         published = proc.attrib.get("published")
         published = published.strip() if isinstance(published, str) else None
@@ -201,7 +205,6 @@ def extract_local_data_item_names(xml_path: str) -> List[str]:
 def get_first_process_published(xml_path: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Return (first_process_name, published_attr_text) from the first <process ...> node.
-    published_attr_text is the literal string (e.g., "True") or None if missing.
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()
@@ -214,7 +217,7 @@ def get_first_process_published(xml_path: str) -> Tuple[Optional[str], Optional[
     return None, None
 
 
-# ---------- Hardcoded literal finder (heuristic) ----------
+# ---------- Hardcoded literal finder (heuristic, optional) ----------
 
 _TEXTY_TAGS = {
     "initialvalue", "expression", "text", "sql", "note", "url", "path", "filename", "address", "value"
@@ -790,7 +793,7 @@ def build_plan_workqueue(
         nonblank_names = sum(1 for v in row_names if v)
         next_no = nonblank_names + 1 if cols["no_col"] is not None else None
 
-    print(f"[WQ] Content rows Excel {_excel_row(content_start)}..{_excel_row(true_end_rel_excl and (content_start + true_end_rel_excl - 1) or content_start)}; "
+    print(f"[WQ] Content rows Excel {_excel_row(content_start)}..{_excel_row(true_end_abs_excl-1)}; "
           f"existing={len(row_names)}; missing_from_excel={len(missing)}")
 
     return {
@@ -798,7 +801,7 @@ def build_plan_workqueue(
         "header_row": header_row,
         "header_excel_row": header_row + 1,
         "start_row_excel": content_start + 1,
-        "row_count": true_end_rel_excl - 0 + 0,  # equal to (true_end_abs_excl - content_start)
+        "row_count": true_end_abs_excl - content_start,
         "insert_at_excel_row": insert_at_excel_row,
         "wq_name_col": wq_name_col,
         "key_col": cols["key_col"],
@@ -1083,11 +1086,11 @@ def adjust_env_local_validation(ws, plan: Dict[str, Any], local_data_item_names:
     return hits
 
 
-def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], published_text: Optional[str]) -> None:
+def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], all_processes_published: bool) -> None:
     """
     Writes Validation only for the 'Is your main process published?' row.
-    - Green if published_text == "True"
-    - Red otherwise (including missing)
+    - Green if all processes have published="True"
+    - Red otherwise
     """
     if plan.get("target_row_rel") is None:
         return
@@ -1097,12 +1100,9 @@ def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], published_text: 
 
     paste_formats_like_left(ws, row_1based, validation_col_1based)
 
-    if published_text == "True":
+    if all_processes_published:
         ws.range((row_1based, validation_col_1based)).value = "Yes"
         ws.range((row_1based, validation_col_1based)).color = COLOR_GREEN
-    elif published_text is None:
-        ws.range((row_1based, validation_col_1based)).value = "Published attribute missing"
-        ws.range((row_1based, validation_col_1based)).color = COLOR_RED
     else:
         ws.range((row_1based, validation_col_1based)).value = "No"
         ws.range((row_1based, validation_col_1based)).color = COLOR_RED
@@ -1152,6 +1152,12 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
     """
     Fill 'Published status', 'Hard coded values' (blank for now), and 'Exception Types'
     for every row in the Process table (existing + inserted).
+
+    Exception Types logic:
+      - consider only types containing the substring 'Exception' (case-insensitive)
+      - if none found => leave BLANK
+      - allowed exact values: 'System Exception', 'Business Exception'
+      - any other '* Exception' => flag as 'Found unknown exception types: ...'
     """
     name_col_1 = plan["name_col"] + 1
     pub_col_1  = plan["published_col"] + 1
@@ -1162,7 +1168,7 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
     for offset in range(total_rows):
         row = plan["start_row_excel"] + offset
         nm = _to_space(ws.range((row, name_col_1)).value).strip()
-        # blank out by default
+        # default: clear cells
         for col1 in (pub_col_1, hard_col_1, exc_col_1):
             paste_formats_like_left(ws, row, col1)
             ws.range((row, col1)).value = ""
@@ -1181,13 +1187,14 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
         # Hard coded values: (placeholder) leave empty for now
 
         # Exception types:
-        types = set(meta.get("exception_types") or [])
-        if types:
-            unknown = [t for t in sorted(types) if t not in _ALLOWED_EXC]
+        raw_types = set(meta.get("exception_types") or [])
+        filtered = [t for t in sorted(raw_types) if "exception" in t.casefold()]
+        if filtered:
+            unknown = [t for t in filtered if t not in _ALLOWED_EXC]
             if unknown:
                 ws.range((row, exc_col_1)).value = f"Found unknown exception types: {', '.join(unknown)}"
             else:
-                ws.range((row, exc_col_1)).value = ", ".join(sorted(types))
+                ws.range((row, exc_col_1)).value = ", ".join(filtered)
 
 
 # ============================ placement helpers ============================
@@ -1285,6 +1292,23 @@ def _sheet_by_name_or_index(wb, sheet_arg):
     return wb.sheets[str(sheet_arg)]
 
 
+def _all_processes_published(proc_meta: Dict[str, Dict[str, Any]]) -> bool:
+    """
+    True if every process that *has* a published attribute has published == "True".
+    Processes without a published attribute are ignored.
+    If no processes have the attribute at all, return False (cannot confirm).
+    """
+    found_any = False
+    for _, info in (proc_meta or {}).items():
+        pub = info.get("published")
+        if pub is None:
+            continue  # ignore processes without published attr
+        found_any = True
+        if pub.lower() != "true":
+            return False
+    return found_any  # True only if at least one had the attr and all were "True"
+
+
 def validate_and_write_dynamic(
     excel_path: str,
     sheet_arg,
@@ -1293,8 +1317,8 @@ def validate_and_write_dynamic(
     xml_wq: Dict[str, Dict[str, Optional[str]]],
     xml_env_prod: List[str],                     # ENV via exposure/block
     xml_local_data_names: List[str],             # local guard
-    first_process_published_text: Optional[str], # BP Scripts Check
-    proc_meta: Dict[str, Dict[str, Any]],        # NEW: per-process metadata
+    all_procs_published_bool: bool,              # BP Scripts Check aggregate
+    proc_meta: Dict[str, Dict[str, Any]],        # per-process metadata
 ) -> None:
 
     # Read for planning (strings, no header)
@@ -1387,6 +1411,9 @@ def validate_and_write_dynamic(
         plans.sort(key=lambda p: p["header_row"])
 
         total_inserted_above = 0
+        # Defer BP Scripts Check writing until the end (safe: we don't insert under it)
+        bp_plans = []
+
         for section_index, plan in enumerate(plans):
             # shift *1-based* fields by rows inserted above
             for key_name in ("start_row_excel", "insert_at_excel_row", "header_excel_row"):
@@ -1408,7 +1435,6 @@ def validate_and_write_dynamic(
             if plan["type"] != "bp_scripts_check":
                 write_existing_validation(ws, plan["start_row_excel"], plan["validation_col"], plan["validation_vals"])
 
-            # fill/insert depending on section
             rows_added_here = 0
             if plan["type"] in ("process", "business_object", "environment_variable_prod"):
                 consumed_count = fill_into_blanks_name_table(ws, plan, plan["missing"])
@@ -1426,7 +1452,7 @@ def validate_and_write_dynamic(
                     write_process_extras(ws, plan, proc_meta)
 
             elif plan["type"] == "bp_scripts_check":
-                write_bp_scripts_check_validation(ws, plan, first_process_published_text)
+                bp_plans.append(plan)  # write this after processing sections
 
             else:  # work_queue
                 consumed_count = fill_into_blanks_wq(ws, plan, plan["missing"], xml_wq)
@@ -1442,6 +1468,10 @@ def validate_and_write_dynamic(
                 ws.api.Columns(validation_col_1based).AutoFit()
             except Exception:
                 pass
+
+        # Now write BP Scripts Check results using the aggregate
+        for plan in bp_plans:
+            write_bp_scripts_check_validation(ws, plan, all_procs_published_bool)
 
         restore_placement(ws, placements)
         wb.save()
@@ -1487,20 +1517,17 @@ def main():
     # Process metadata (published + exception types)
     proc_meta = get_process_metadata(args.xml)
 
-    # First process's published attribute (used in BP Scripts Check)
+    # First process's published attribute (still printed for traceability)
     first_proc_name, first_proc_published = get_first_process_published(args.xml)
+
+    # Aggregate for BP Scripts Check
+    all_published = _all_processes_published(proc_meta)
 
     # Console summary
     print(f"✅ XML: processes={len(xml_proc)}, business_objects={len(xml_bo)}, "
           f"work_queues={len(xml_wq)}, env_vars={len(xml_env_prod)}, local_data_items={len(xml_local_data_names)}")
-    print(f"ℹ️ Main process assumed = first <process>: '{first_proc_name or 'N/A'}', published={first_proc_published or 'N/A'}")
-    # Also show a quick published/exception summary (first 5)
-    if proc_meta:
-        print("ℹ️ Example processes metadata (first 5):")
-        for i, (pn, md) in enumerate(proc_meta.items()):
-            if i >= 5:
-                break
-            print(f"   - {pn}: published={md.get('published')}, exceptions={sorted(md.get('exception_types') or [])}")
+    print(f"ℹ️ First <process>: '{first_proc_name or 'N/A'}', published={first_proc_published or 'N/A'}")
+    print(f"ℹ️ BP Scripts Check aggregate — ALL processes published: {all_published}")
 
     # Optional: hardcoded literal scan/report
     if args.hardcoded_csv is not None:
@@ -1522,7 +1549,7 @@ def main():
         xml_wq=xml_wq,
         xml_env_prod=xml_env_prod,
         xml_local_data_names=xml_local_data_names,
-        first_process_published_text=first_proc_published,
+        all_procs_published_bool=all_published,
         proc_meta=proc_meta,
     )
 
