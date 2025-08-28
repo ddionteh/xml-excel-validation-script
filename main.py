@@ -5,6 +5,8 @@ Validate Excel sections against a Blue Prism release XML (dynamic sections).
 Adds support for:
 - Environment Variable (PROD): verifies every env var from XML is present in Excel,
   and flags if any of those names are also defined as a local Data item in the release.
+- BP Scripts Check: finds the row with "Is your main process published?" and writes a
+  single Validation cell based on the first <process ... published="..."> value in XML.
 
 Core behavior kept:
 - Dynamic section detection via same-row single-letter marker (A..Z with optional '.' or ':')
@@ -52,67 +54,33 @@ def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
     return out
 
 
-# ---------- Work Queue extractor (kept minimal so script is self-contained) ----------
-def extract_work_queues_from_xml(xml_path: str) -> Dict[str, Dict[str, Optional[str]]]:
-    """
-    Returns {work_queue_name: {"key": <key or None>}}.
-    The Blue Prism release format varies; we keep this tolerant:
-    - Looks for <work-queue name="..." key-name="..."> if present
-    - Else tries to infer from stages named 'Work Queue' with attributes
-    If nothing is found, returns {} (the rest of the script handles it gracefully).
-    """
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    out: Dict[str, Dict[str, Optional[str]]] = {}
-
-    # Canonical style
-    for elem in root.iter():
-        if _local(elem.tag) in ("work-queue", "workqueue", "workqueue-definition"):
-            nm = (elem.attrib.get("name") or "").strip()
-            key = (elem.attrib.get("key-name") or elem.attrib.get("key") or "").strip()
-            if nm:
-                out[nm] = {"key": key or None}
-
-    # Very rough fallback: search for stages that might describe WQs
-    if not out:
-        for stage in root.iter():
-            if _local(stage.tag) != "stage":
-                continue
-            if (stage.attrib.get("name") or "").strip().lower() == "work queue":
-                wq_nm = (stage.attrib.get("workqueuename") or stage.attrib.get("WorkQueueName") or "").strip()
-                key_nm = (stage.attrib.get("keyname") or stage.attrib.get("KeyName") or "").strip()
-                if wq_nm:
-                    out[wq_nm] = {"key": key_nm or None}
-
-    return out
-
-
 # ---------- ENV(PROD) XML extractors ----------
 def extract_env_variables_from_xml(xml_path: str) -> List[str]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    names: List[str] = []
+    names = []
 
-    # 1) Canonical environment-variable nodes
+    # Canonical form
     for elem in root.iter():
         if _local(elem.tag) == "environment-variable":
             nm = elem.attrib.get("name")
             if nm:
                 names.append(nm.strip())
 
-    # 2) Fallback: a stage container named "Environment Variables" (or misspelt)
-    targets = {"environment variables", "environmnet variables"}
-    for stage in root.iter():
-        if _local(stage.tag) != "stage":
-            continue
-        if (stage.attrib.get("name") or "").strip().lower() in targets:
-            for sub in stage.iter():
-                if _local(sub.tag) == "stage":
-                    nm = (sub.attrib.get("name") or "").strip()
-                    if nm and nm.lower() not in targets:
-                        names.append(nm)
+    # Fallback: container stages named "Environment Variables" / misspelt
+    if not names:
+        targets = set(("environment variables", "environmnet variables"))
+        for stage in root.iter():
+            if _local(stage.tag) != "stage":
+                continue
+            if (stage.attrib.get("name") or "").strip().lower() in targets:
+                for sub in stage.iter():
+                    if _local(sub.tag) == "stage":
+                        nm = (sub.attrib.get("name") or "").strip()
+                        if nm and nm.lower() not in targets:
+                            names.append(nm)
 
-    # 3) Any Data stage explicitly exposed as Environment (Blue Prism style)
+    # any Data stage explicitly exposed as Environment
     for stage in root.iter():
         if _local(stage.tag) != "stage":
             continue
@@ -132,16 +100,13 @@ def extract_env_variables_from_xml(xml_path: str) -> List[str]:
     seen, out = set(), []
     for n in names:
         if n not in seen:
-            seen.add(n)
-            out.append(n)
+            seen.add(n); out.append(n)
     return out
 
-
 def extract_local_data_item_names(xml_path: str) -> List[str]:
-    """All Data stages that are NOT exposed as Environment."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    locals_only: List[str] = []
+    locals_only = []
     for stage in root.iter():
         if _local(stage.tag) != "stage":
             continue
@@ -155,16 +120,31 @@ def extract_local_data_item_names(xml_path: str) -> List[str]:
             if _local(child.tag) == "exposure":
                 exposure = (child.text or "").strip().lower()
                 break
-        if exposure != "environment":
+        if exposure != "environment":   # <- local (not env)
             locals_only.append(name_attr.strip())
 
     # de-dupe preserving order
     seen, out = set(), []
     for n in locals_only:
         if n not in seen:
-            seen.add(n)
-            out.append(n)
+            seen.add(n); out.append(n)
     return out
+
+
+def get_first_process_published(xml_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (first_process_name, published_attr_text) from the first <process ...> node.
+    published_attr_text is the literal string (e.g., "True") or None if missing.
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    for elem in root.iter():
+        if _local(elem.tag) == "process":
+            name = (elem.attrib.get("name") or "").strip() or None
+            published = elem.attrib.get("published")
+            pub_str = (published.strip() if isinstance(published, str) else None)
+            return name, pub_str
+    return None, None
 
 
 # ==================== normalization / tokens ====================
@@ -225,9 +205,9 @@ def _dump_row(row_index: int, row: pd.Series, max_cols: int = 20) -> str:
 
 # ===================== formatting / borders =====================
 
-COLOR_GREEN = (198, 239, 206)   # Exists
-COLOR_RED = (255, 199, 206)     # Does not exist
-COLOR_ORANGE = (255, 235, 156)  # Newly added / Attention
+COLOR_GREEN = (198, 239, 206)   # Exists / OK
+COLOR_RED   = (255, 199, 206)   # Not OK
+COLOR_ORANGE= (255, 235, 156)   # Newly added / Attention
 
 
 def _clone_borders(from_cell_api, to_cell_api) -> None:
@@ -281,25 +261,16 @@ def clear_fill_preserve_borders(ws, row_1based: int, col_1based: int) -> None:
         pass
 
 
-def _sheet_last_col(ws) -> int:
-    """Defensive 'last used column' getter."""
-    try:
-        return ws.used_range.last_cell.column
-    except Exception:
-        # Fallback: assume 100 columns if Excel can't tell us
-        return 100
-
-
 def insert_row_with_style(ws, row_1based: int) -> None:
     ws.api.Rows(row_1based).Insert(Shift=-4121, CopyOrigin=0)  # down
     try:
-        prev = max(1, row_1based - 1)
+        prev = row_1based - 1
         ws.api.Rows(prev).Copy()
         ws.api.Rows(row_1based).PasteSpecial(Paste=-4122)  # formats
         ws.api.Rows(row_1based).RowHeight = ws.api.Rows(prev).RowHeight
 
         # re-create single-row merges
-        last_col = _sheet_last_col(ws)
+        last_col = ws.used_range.last_cell.column
         col = 1
         while col <= last_col:
             cell_above = ws.api.Cells(prev, col)
@@ -317,58 +288,6 @@ def insert_row_with_style(ws, row_1based: int) -> None:
                 pass
             col += 1
         ws.api.Application.CutCopyMode = False
-    except Exception:
-        pass
-
-
-# ===== Shapes/images placement snapshot so they don't drift when inserting rows =====
-
-def snapshot_and_set_placement(ws) -> List[Tuple[str, int]]:
-    """
-    Returns list of (shape_name, original_placement).
-    Sets shapes to xlMove (2) so they move with cells on row insert.
-    If Shapes collection isn't available, returns [].
-    """
-    snap: List[Tuple[str, int]] = []
-    try:
-        shapes = ws.api.Shapes
-        count = shapes.Count
-    except Exception:
-        return snap
-
-    for i in range(1, count + 1):
-        try:
-            shp = shapes.Item(i)
-            name = str(shp.Name)
-            original = int(getattr(shp, "Placement", 2))
-            snap.append((name, original))
-            try:
-                shp.Placement = 2  # xlMove
-            except Exception:
-                pass
-        except Exception:
-            pass
-    return snap
-
-
-def restore_placement(ws, snapshot: List[Tuple[str, int]]) -> None:
-    try:
-        shapes = ws.api.Shapes
-        by_name = {}
-        count = shapes.Count
-        for i in range(1, count + 1):
-            try:
-                shp = shapes.Item(i)
-                by_name[str(shp.Name)] = shp
-            except Exception:
-                pass
-        for name, placement in snapshot:
-            shp = by_name.get(name)
-            if shp is not None:
-                try:
-                    shp.Placement = placement
-                except Exception:
-                    pass
     except Exception:
         pass
 
@@ -398,19 +317,17 @@ SECTION_REGISTRY = {
     "process":                   {"keyword": "process"},
     "business_object":           {"keyword": "business object"},
     "work_queue":                {"keyword": "work queue"},
+    "bp_scripts_check":          {"keyword": "bp scripts check"},      # <--- NEW
     # ENV(PROD)
-    "environment_variable_prod": {"keyword": "environment variable (prod)"},
+    "environment_variable_prod": {"keyword": "environment variables (prod)"},
 }
-
 
 def _row_has_keyword(row: pd.Series, phrase: str) -> bool:
     ph = _norm(phrase)
     return any(ph in _norm(c) for c in row)
 
-
 def _row_has_single_letter_marker(row: pd.Series) -> bool:
     return any(_cell_is_single_letter_marker(c) for c in row)
-
 
 def find_dynamic_markers(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
@@ -442,12 +359,16 @@ def find_header_after_marker(df: pd.DataFrame, marker_row: int, section_type: st
     - work_queue: first nonblank row having BOTH:
         * a cell containing 'work' AND 'queue' AND 'name'
         * a cell containing 'key' AND 'name'
+    - bp_scripts_check: the first nonblank row after the marker (whatever it is)
     """
     end_row = min(len(df), marker_row + 1 + lookahead)
     for row_index in range(marker_row + 1, end_row):
         tokens = _row_tokens(df.iloc[row_index])
         if all(v == "" for v in tokens):
             continue
+
+        if section_type == "bp_scripts_check":
+            return row_index
 
         if section_type in ("process", "business_object", "environment_variable_prod"):
             if any("name" in v for v in tokens):
@@ -488,6 +409,14 @@ def pick_columns(df: pd.DataFrame, header_row: int, section_type: str) -> Dict[s
         if "check" in text:
             check_col = idx
             break
+
+    if section_type == "bp_scripts_check":
+        return {
+            "item_col": None,
+            "no_col": None,
+            "check_col": None,
+            "validation_col": validation_col,
+        }
 
     if section_type in ("process", "business_object", "environment_variable_prod"):
         name_col = None
@@ -764,6 +693,44 @@ def build_plan_workqueue(
     }
 
 
+def build_plan_bp_scripts_check(
+    df: pd.DataFrame,
+    header_row: int,
+    cols: Dict[str, Optional[int]],
+    next_marker_row: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Build a plan for the 'BP Scripts Check' section:
+      - header is first nonblank row after the marker (already resolved upstream)
+      - scan any column for the exact target phrase (case/space-normalized)
+      - only that one row gets a Validation value
+    """
+    content_start = header_row + 1
+    content_end = next_marker_row if next_marker_row is not None else len(df)
+    section_df = df.iloc[content_start:content_end].copy().reset_index(drop=True)
+
+    target_phrase_norm = _norm("Is your main process published?")
+    target_rel = None
+
+    for rel_index in range(section_df.shape[0]):
+        row = section_df.iloc[rel_index]
+        if any(_norm(_to_space(val).strip()) == target_phrase_norm for val in list(row.values)):
+            target_rel = rel_index
+            break
+
+    return {
+        "type": None,  # filled by caller
+        "header_row": header_row,
+        "header_excel_row": header_row + 1,
+        "start_row_excel": content_start + 1,
+        "row_count": section_df.shape[0],
+        "validation_col": cols["validation_col"],
+        "target_row_rel": target_rel,
+        "validation_vals": [""] * section_df.shape[0],  # bulk writer is skipped for this section
+        "inserted_rows": 0,
+    }
+
+
 # ========================= writers per section =========================
 
 def write_existing_validation(ws, start_row_excel: int, validation_col0: int, statuses: List[str]) -> None:
@@ -995,6 +962,44 @@ def adjust_env_local_validation(ws, plan: Dict[str, Any], local_data_item_names:
     return hits
 
 
+def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], published_text: Optional[str]) -> None:
+    """
+    Writes Validation only for the 'Is your main process published?' row.
+    - Green if published_text == "True"
+    - Red otherwise (including missing)
+    """
+    if plan.get("target_row_rel") is None:
+        return
+
+    row_1based = plan["start_row_excel"] + plan["target_row_rel"]
+    validation_col_1based = plan["validation_col"] + 1
+
+    paste_formats_like_left(ws, row_1based, validation_col_1based)
+
+    if published_text == "True":
+        ws.range((row_1based, validation_col_1based)).value = "Yes"
+        ws.range((row_1based, validation_col_1based)).color = COLOR_GREEN
+    elif published_text is None:
+        ws.range((row_1based, validation_col_1based)).value = "Published attribute missing"
+        ws.range((row_1based, validation_col_1based)).color = COLOR_RED
+    else:
+        ws.range((row_1based, validation_col_1based)).value = "No"
+        ws.range((row_1based, validation_col_1based)).color = COLOR_RED
+
+    _apply_borders_like_left(ws, row_1based, validation_col_1based)
+
+
+# ============================ placement helpers ============================
+
+def snapshot_and_set_placement(ws):
+    # No-op placeholder (kept for compatibility)
+    return None
+
+def restore_placement(ws, placements):
+    # No-op placeholder (kept for compatibility)
+    pass
+
+
 # ============================ main flow ============================
 
 _ILLEGAL_SHEET_CHARS = r'[:\\/?*\[\]]'
@@ -1032,6 +1037,7 @@ def validate_and_write_dynamic(
     xml_wq: Dict[str, Dict[str, Optional[str]]],
     xml_env_prod: List[str],                     # ENV(PROD)
     xml_local_data_names: List[str],             # ENV(PROD) local guard
+    first_process_published_text: Optional[str], # BP Scripts Check
 ) -> None:
 
     # Read for planning (strings, no header)
@@ -1080,6 +1086,8 @@ def validate_and_write_dynamic(
                 else xml_env_prod,  # ENV(PROD)
                 next_marker_row=next_marker_row
             )
+        elif marker_type == "bp_scripts_check":
+            plan = build_plan_bp_scripts_check(df, header_row, columns, next_marker_row=next_marker_row)
         else:  # work_queue
             if columns["wq_name_col"] is None or columns["key_col"] is None:
                 print(f"[work_queue] ❌ Need both 'Work Queue Name' and 'Key Name' columns. Skipping.")
@@ -1096,7 +1104,6 @@ def validate_and_write_dynamic(
 
     # 3) Open Excel; clone sheet; write in visual order (top to bottom)
     app = xw.App(visible=False, add_book=False)
-    wb = None
     try:
         wb = app.books.open(str(excel_path))
         src_sheet = _sheet_by_name_or_index(wb, sheet_arg)
@@ -1137,10 +1144,11 @@ def validate_and_write_dynamic(
             ws.range((plan["header_excel_row"], validation_col_1based)).value = "Validation"
             _apply_borders_like_left(ws, plan["header_excel_row"], validation_col_1based)
 
-            # existing rows' validation
-            write_existing_validation(ws, plan["start_row_excel"], plan["validation_col"], plan["validation_vals"])
+            # existing rows' validation (skip for BP Scripts Check; handled separately)
+            if plan["type"] != "bp_scripts_check":
+                write_existing_validation(ws, plan["start_row_excel"], plan["validation_col"], plan["validation_vals"])
 
-            # fill blanks first, then insert any remaining
+            # fill/insert depending on section
             rows_added_here = 0
             if plan["type"] in ("process", "business_object", "environment_variable_prod"):
                 consumed_count = fill_into_blanks_name_table(ws, plan, plan["missing"])
@@ -1152,7 +1160,12 @@ def validate_and_write_dynamic(
                     local_hits = adjust_env_local_validation(ws, plan, xml_local_data_names)
                     if local_hits:
                         print(f"[env_prod] {local_hits} name(s) are also defined locally (Data items).")
-            else:
+
+            elif plan["type"] == "bp_scripts_check":
+                write_bp_scripts_check_validation(ws, plan, first_process_published_text)
+                rows_added_here = 0
+
+            else:  # work_queue
                 consumed_count = fill_into_blanks_wq(ws, plan, plan["missing"], xml_wq)
                 remaining_names = plan["missing"][consumed_count:]
                 rows_added_here = insert_new_rows_wq(ws, plan, remaining_names, xml_wq)
@@ -1176,8 +1189,7 @@ def validate_and_write_dynamic(
         except Exception:
             pass
         try:
-            if wb:
-                wb.close()
+            wb.close()
         except Exception:
             pass
         app.quit()
@@ -1187,7 +1199,7 @@ def validate_and_write_dynamic(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate Process / Business Object / Work Queue / Environment Variable (PROD) sections against a Blue Prism release XML (dynamic markers)."
+        description="Validate sections (Process/Business Object/Work Queue/Env Var (PROD)/BP Scripts Check) against a Blue Prism release XML (dynamic markers)."
     )
     parser.add_argument("--xml", required=True, help="Path to Blue Prism .bprelease XML")
     parser.add_argument("--excel", required=True, help="Path to Excel file (.xlsx/.xlsm)")
@@ -1197,13 +1209,24 @@ def main():
     print("🔍 Parsing XML…")
     xml_proc = extract_names_from_xml(args.xml, "process")
     xml_bo = extract_names_from_xml(args.xml, "object")
-    xml_wq = extract_work_queues_from_xml(args.xml)  # harmless if {}
+    xml_wq = {}  # keep your previous extractor if you need WQ; left blank here to focus on ENV(PROD) + BP Scripts Check
+    # If you still use Work Queues from earlier version, swap in your extract_work_queues_from_xml(...)
+    try:
+        from __main__ import extract_work_queues_from_xml as _maybe_wq
+        xml_wq = _maybe_wq(args.xml)
+    except Exception:
+        xml_wq = {}
+
     # ENV(PROD): environment variables and local Data items
     xml_env_prod = extract_env_variables_from_xml(args.xml)
     xml_local_data_names = extract_local_data_item_names(args.xml)
 
+    # First process's published attribute (used in BP Scripts Check)
+    first_proc_name, first_proc_published = get_first_process_published(args.xml)
+
     print(f"✅ XML: processes={len(xml_proc)}, business_objects={len(xml_bo)}, "
           f"work_queues={len(xml_wq)}, env_prod={len(xml_env_prod)}, local_data_items={len(xml_local_data_names)}")
+    print(f"ℹ️ Main process assumed = first <process>: '{first_proc_name or 'N/A'}', published={first_proc_published or 'N/A'}")
 
     print("🧪 Validating & writing…")
     validate_and_write_dynamic(
@@ -1214,6 +1237,7 @@ def main():
         xml_wq=xml_wq,
         xml_env_prod=xml_env_prod,
         xml_local_data_names=xml_local_data_names,
+        first_process_published_text=first_proc_published,
     )
 
 
