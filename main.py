@@ -39,6 +39,7 @@ from typing import List, Optional, Dict, Any, Tuple, Set
 
 import pandas as pd
 import xlwings as xw
+from contextlib import contextmanager
 
 
 # ========================= XML helpers =========================
@@ -101,6 +102,37 @@ def get_process_metadata(xml_path: str) -> Dict[str, Dict[str, Any]]:
 
     return meta
 
+@contextmanager
+def excel_perf_mode(app):
+    """
+    Temporarily speed up Excel COM operations.
+    Restores everything on exit.
+    """
+    api = app.api
+    prev = {}
+    for prop in ("ScreenUpdating", "DisplayAlerts", "EnableEvents", "Calculation"):
+        try:
+            prev[prop] = getattr(api, prop)
+        except Exception:
+            prev[prop] = None
+    try:
+        try: api.ScreenUpdating = False
+        except Exception: pass
+        try: api.DisplayAlerts = False
+        except Exception: pass
+        try: api.EnableEvents = False
+        except Exception: pass
+        try: api.Calculation = -4135   # xlCalculationManual
+        except Exception: pass
+        yield
+    finally:
+        try:
+            if prev.get("Calculation") is not None: api.Calculation = prev["Calculation"]
+            if prev.get("ScreenUpdating") is not None: api.ScreenUpdating = prev["ScreenUpdating"]
+            if prev.get("DisplayAlerts") is not None: api.DisplayAlerts = prev["DisplayAlerts"]
+            if prev.get("EnableEvents") is not None: api.EnableEvents = prev["EnableEvents"]
+        except Exception:
+            pass
 
 # ---------- Environment variables via exposure / block ----------
 
@@ -1294,19 +1326,32 @@ def _sheet_by_name_or_index(wb, sheet_arg):
 
 def _all_processes_published(proc_meta: Dict[str, Dict[str, Any]]) -> bool:
     """
-    True if every process that *has* a published attribute has published == "True".
+    True iff every process that *has* a published attribute has published == True (case-insensitive).
     Processes without a published attribute are ignored.
-    If no processes have the attribute at all, return False (cannot confirm).
+    If none have the attribute at all, return False and say so.
+    Also prints any processes that are not True.
     """
     found_any = False
-    for _, info in (proc_meta or {}).items():
+    failing = []
+    for name, info in (proc_meta or {}).items():
         pub = info.get("published")
         if pub is None:
             continue  # ignore processes without published attr
         found_any = True
-        if pub.lower() != "true":
-            return False
-    return found_any  # True only if at least one had the attr and all were "True"
+        if str(pub).strip().casefold() != "true":
+            failing.append((name or "(unnamed)", pub))
+
+    if not found_any:
+        print("[BP Scripts Check] No processes have a 'published' attribute; treating aggregate as False.")
+        return False
+
+    if failing:
+        print("[BP Scripts Check] Processes with non-True 'published':")
+        for nm, val in failing:
+            print(f"  - {nm}: published='{val}'")
+        return False
+
+    return True
 
 
 def validate_and_write_dynamic(
@@ -1315,12 +1360,12 @@ def validate_and_write_dynamic(
     xml_proc: List[str],
     xml_bo: List[str],
     xml_wq: Dict[str, Dict[str, Optional[str]]],
-    xml_env_prod: List[str],                     # ENV via exposure/block
-    xml_local_data_names: List[str],             # local guard
-    all_procs_published_bool: bool,              # BP Scripts Check aggregate
-    proc_meta: Dict[str, Dict[str, Any]],        # per-process metadata
+    xml_env_prod: List[str],                     # ENV(PROD)
+    xml_local_data_names: List[str],             # ENV(PROD) local guard
+    first_process_published_text: Optional[str], # (unused here if you aggregate later)
+    proc_meta: Optional[Dict[str, Dict[str, Any]]] = None,  # contains per-process published/exception info if you pass it
+    all_procs_published_bool: Optional[bool] = None,        # aggregate used by BP Scripts Check writer
 ) -> None:
-
     # Read for planning (strings, no header)
     sheet_arg_pd = int(sheet_arg) if (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()) else sheet_arg
     df = pd.read_excel(excel_path, sheet_name=sheet_arg_pd, header=None, dtype=str, engine="openpyxl").fillna("")
@@ -1336,7 +1381,6 @@ def validate_and_write_dynamic(
     for marker_index, marker in enumerate(markers):
         marker_row = marker["row"]
         marker_type = marker["type"]
-
         next_marker_row: Optional[int] = markers[marker_index + 1]["row"] if marker_index + 1 < len(markers) else None
 
         if marker_type == "unknown":
@@ -1363,7 +1407,7 @@ def validate_and_write_dynamic(
                 columns["validation_col"],
                 xml_proc if marker_type == "process"
                 else xml_bo if marker_type == "business_object"
-                else xml_env_prod,  # ENV via exposure/block
+                else xml_env_prod,  # ENV(PROD)
                 next_marker_row=next_marker_row
             )
         elif marker_type == "bp_scripts_check":
@@ -1382,111 +1426,186 @@ def validate_and_write_dynamic(
         print("⛔ No valid sections planned. Nothing to write.")
         return
 
-    # 3) Open Excel; clone sheet; manage object placement; write
+    # 3) Open Excel; clone sheet; manage object placement; write   (with perf mode ON)
     app = xw.App(visible=False, add_book=False)
+    wb = None
     try:
-        wb = app.books.open(str(excel_path))
-        src_sheet = _sheet_by_name_or_index(wb, sheet_arg)
+        with excel_perf_mode(app):  # perf wrapper
+            wb = app.books.open(str(excel_path))
+            src_sheet = _sheet_by_name_or_index(wb, sheet_arg)
 
-        try:
-            app.api.EnableEvents = False
-        except Exception:
-            pass
-
-        before_names = [s.name for s in wb.sheets]
-        src_sheet.api.Copy(After=src_sheet.api)
-        after_names = [s.name for s in wb.sheets]
-        added = [n for n in after_names if n not in before_names]
-        ws = wb.sheets[added[0]] if len(added) == 1 else wb.sheets[-1]
-
-        new_name = _unique_sheet_name(wb, f"{src_sheet.name}_validated")
-        try:
-            ws.name = new_name
-        except Exception as e:
-            print(f"⚠️ Rename failed ({e}); keeping '{ws.name}'")
-
-        placements = snapshot_and_set_placement(ws)
-
-        # Sort by on-sheet order and accumulate inserted rows to offset subsequent plans
-        plans.sort(key=lambda p: p["header_row"])
-
-        total_inserted_above = 0
-        # Defer BP Scripts Check writing until the end (safe: we don't insert under it)
-        bp_plans = []
-
-        for section_index, plan in enumerate(plans):
-            # shift *1-based* fields by rows inserted above
-            for key_name in ("start_row_excel", "insert_at_excel_row", "header_excel_row"):
-                if key_name in plan and isinstance(plan[key_name], int):
-                    plan[key_name] += total_inserted_above
-
-            # If this is the Process section, reserve the 3 columns before Validation
-            if plan["type"] == "process":
-                _ensure_process_extra_columns_in_plan(plan)
-                _write_process_extra_headers(ws, plan)
-
-            # write "Validation" on the header row (column headers)
-            validation_col_1based = plan["validation_col"] + 1
-            paste_formats_like_left(ws, plan["header_excel_row"], validation_col_1based)
-            ws.range((plan["header_excel_row"], validation_col_1based)).value = "Validation"
-            _apply_borders_like_left(ws, plan["header_excel_row"], validation_col_1based)
-
-            # existing rows' validation (skip for BP Scripts Check; handled separately)
-            if plan["type"] != "bp_scripts_check":
-                write_existing_validation(ws, plan["start_row_excel"], plan["validation_col"], plan["validation_vals"])
-
-            rows_added_here = 0
-            if plan["type"] in ("process", "business_object", "environment_variable_prod"):
-                consumed_count = fill_into_blanks_name_table(ws, plan, plan["missing"])
-                remaining_names = plan["missing"][consumed_count:]
-                rows_added_here = insert_new_rows_name_table(ws, plan, remaining_names)
-
-                # ENV local-variable guard
-                if plan["type"] == "environment_variable_prod":
-                    local_hits = adjust_env_local_validation(ws, plan, xml_local_data_names)
-                    if local_hits:
-                        print(f"[env_prod] {local_hits} name(s) are also defined locally (Data items).")
-
-                # Process extras after rows are finalized
-                if plan["type"] == "process":
-                    write_process_extras(ws, plan, proc_meta)
-
-            elif plan["type"] == "bp_scripts_check":
-                bp_plans.append(plan)  # write this after processing sections
-
-            else:  # work_queue
-                consumed_count = fill_into_blanks_wq(ws, plan, plan["missing"], xml_wq)
-                remaining_names = plan["missing"][consumed_count:]
-                rows_added_here = insert_new_rows_wq(ws, plan, remaining_names, xml_wq)
-                mismatch_count = adjust_wq_key_validation(ws, plan, xml_wq)
-                print(f"[work_queue] filled={consumed_count}, inserted={rows_added_here}, key_mismatches={mismatch_count}")
-
-            total_inserted_above += rows_added_here
-
-            # Autofit Validation column
             try:
-                ws.api.Columns(validation_col_1based).AutoFit()
+                app.api.EnableEvents = False
             except Exception:
                 pass
 
-        # Now write BP Scripts Check results using the aggregate
-        for plan in bp_plans:
-            write_bp_scripts_check_validation(ws, plan, all_procs_published_bool)
+            before_names = [s.name for s in wb.sheets]
+            src_sheet.api.Copy(After=src_sheet.api)
+            after_names = [s.name for s in wb.sheets]
+            added = [n for n in after_names if n not in before_names]
+            ws = wb.sheets[added[0]] if len(added) == 1 else wb.sheets[-1]
 
-        restore_placement(ws, placements)
-        wb.save()
-        print(f"✅ Completed. Wrote '{ws.name}'.")
+            new_name = _unique_sheet_name(wb, f"{src_sheet.name}_validated")
+            try:
+                ws.name = new_name
+            except Exception as e:
+                print(f"⚠️ Rename failed ({e}); keeping '{ws.name}'")
+
+            placements = snapshot_and_set_placement(ws)
+
+            # Sort by on-sheet order and accumulate inserted rows to offset subsequent plans
+            plans.sort(key=lambda p: p["header_row"])
+
+            total_inserted_above = 0
+            bp_plans = []  # write BP Scripts Check at the end
+
+            for section_index, plan in enumerate(plans):
+                # shift *1-based* fields by rows inserted above
+                for key_name in ("start_row_excel", "insert_at_excel_row", "header_excel_row"):
+                    if key_name in plan and isinstance(plan[key_name], int):
+                        plan[key_name] += total_inserted_above
+
+                # If this is the Process section, reserve the 3 columns before Validation
+                if plan["type"] == "process":
+                    _ensure_process_extra_columns_in_plan(plan)
+                    _write_process_extra_headers(ws, plan)
+
+                # write "Validation" on the header row (column headers)
+                validation_col_1based = plan["validation_col"] + 1
+                paste_formats_like_left(ws, plan["header_excel_row"], validation_col_1based)
+                ws.range((plan["header_excel_row"], validation_col_1based)).value = "Validation"
+                _apply_borders_like_left(ws, plan["header_excel_row"], validation_col_1based)
+
+                # existing rows' validation (skip for BP Scripts Check; handled separately)
+                if plan["type"] != "bp_scripts_check":
+                    write_existing_validation(ws, plan["start_row_excel"], plan["validation_col"], plan["validation_vals"])
+
+                rows_added_here = 0
+                if plan["type"] in ("process", "business_object", "environment_variable_prod"):
+                    consumed_count = fill_into_blanks_name_table(ws, plan, plan["missing"])
+                    remaining_names = plan["missing"][consumed_count:]
+                    rows_added_here = insert_new_rows_name_table(ws, plan, remaining_names)
+
+                    # ENV local-variable guard
+                    if plan["type"] == "environment_variable_prod":
+                        local_hits = adjust_env_local_validation(ws, plan, xml_local_data_names)
+                        if local_hits:
+                            print(f"[env_prod] {local_hits} name(s) are also defined locally (Data items).")
+
+                    # Process extras after rows are finalized
+                    if plan["type"] == "process":
+                        write_process_extras(ws, plan, proc_meta)
+
+                elif plan["type"] == "bp_scripts_check":
+                    bp_plans.append(plan)  # defer to end
+
+                else:  # work_queue
+                    consumed_count = fill_into_blanks_wq(ws, plan, plan["missing"], xml_wq)
+                    remaining_names = plan["missing"][consumed_count:]
+                    rows_added_here = insert_new_rows_wq(ws, plan, remaining_names, xml_wq)
+
+                    # (#5) uses the *batched* adjust_wq_key_validation implementation you added earlier
+                    mismatch_count = adjust_wq_key_validation(ws, plan, xml_wq)
+                    print(f"[work_queue] filled={consumed_count}, inserted={rows_added_here}, key_mismatches={mismatch_count}")
+
+                total_inserted_above += rows_added_here
+
+                # Autofit Validation column
+                try:
+                    ws.api.Columns(validation_col_1based).AutoFit()
+                except Exception:
+                    pass
+
+                # ----- alignment + wrap on this section -----
+                section_start = plan["start_row_excel"]
+                section_rows  = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
+                section_end   = section_start + section_rows - 1
+                last_col      = ws.used_range.last_cell.column
+
+                if plan.get("inserted_rows", 0):
+                    cols_all = list(range(1, last_col + 1))
+                    _apply_alignment_like_header_for_rows(
+                        ws,
+                        plan["header_excel_row"],
+                        plan["insert_at_excel_row"],
+                        plan["insert_at_excel_row"] + plan["inserted_rows"] - 1,
+                        cols_all,
+                    )
+
+                header_map = _header_index_map(ws, plan["header_excel_row"])
+                target_cols = []
+                for label in ("published status", "hard coded values", "exception types", "validation"):
+                    idx = header_map.get(label)
+                    if idx:
+                        target_cols.append(idx)
+
+                if target_cols:
+                    _wrap_columns_and_autofit_rows(ws, section_start, section_end, target_cols)
+                    _apply_alignment_like_header_for_rows(
+                        ws,
+                        plan["header_excel_row"],
+                        section_start,
+                        section_end,
+                        target_cols,
+                    )
+                # ----- end alignment + wrap -----
+
+            # Now write BP Scripts Check results using the aggregate
+            for plan in bp_plans:
+                write_bp_scripts_check_validation(ws, plan, all_procs_published_bool)
+
+            restore_placement(ws, placements)
+            wb.save()
+            print(f"✅ Completed. Wrote '{ws.name}'.")
     finally:
         try:
             app.api.EnableEvents = True
         except Exception:
             pass
         try:
-            wb.close()
+            if wb is not None:
+                wb.close()
         except Exception:
             pass
         app.quit()
 
+def _apply_alignment_like_header_for_rows(ws, header_row_1based: int, start_row_1based: int, end_row_1based: int, cols: List[int]) -> None:
+    if start_row_1based > end_row_1based:
+        return
+    for c in cols:
+        try:
+            hdr = ws.api.Cells(header_row_1based, c)
+            rng = ws.api.Range(ws.api.Cells(start_row_1based, c), ws.api.Cells(end_row_1based, c))
+            rng.HorizontalAlignment = hdr.HorizontalAlignment
+            rng.VerticalAlignment = hdr.VerticalAlignment
+        except Exception:
+            pass
+
+def _wrap_columns_and_autofit_rows(ws, start_row_1based: int, end_row_1based: int, cols: List[int]) -> None:
+    if start_row_1based > end_row_1based:
+        return
+    for c in cols:
+        try:
+            rng = ws.api.Range(ws.api.Cells(start_row_1based, c), ws.api.Cells(end_row_1based, c))
+            rng.WrapText = True
+        except Exception:
+            pass
+    try:
+        ws.api.Rows(f"{start_row_1based}:{end_row_1based}").AutoFit()
+    except Exception:
+        pass
+
+def _header_index_map(ws, header_row_1based: int) -> Dict[str, int]:
+    last_col = ws.used_range.last_cell.column
+    vals = ws.range((header_row_1based, 1), (header_row_1based, last_col)).value
+    if isinstance(vals, list) and len(vals) and isinstance(vals[0], list):
+        vals = vals[0]
+    out = {}
+    for i, v in enumerate(vals or [], start=1):
+        key = _norm(v)
+        if key and key not in out:
+            out[key] = i
+    return out
 
 # =============================== CLI ===============================
 
