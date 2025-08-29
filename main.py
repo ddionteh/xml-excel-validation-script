@@ -2,36 +2,19 @@
 """
 Validate Excel sections against a Blue Prism release XML (dynamic sections).
 
-What’s in here
---------------
-- Process section: inserts THREE columns before Validation:
-    1) Published status
-    2) Hard coded values   (writes ALL detected paths/URLs, newline-separated)
-    3) Exception Types
-  (then writes Validation to the right)
-
-- Business Object section: inserts THREE columns before Validation:
-    1) Common Object       (Yes/No using a .txt list, one name per line)
-    2) Hard coded values   (ALL paths/URLs)
-    3) Exception Types     (prints found types to console)
-
-- BP Scripts Check: "Is your main process published?" = YES only if every process
-  that HAS a published value evaluates to True (case-insensitive).
-
-- Environment Variables (PROD): via Data stages with <exposure>Environment</exposure>
-  (preferred) + fallback search around “Environment Variables” container.
-
-- Work Queue: detects the section by “Work Queue Name” + “Key Name” headers and
-  reconciles names/keys pulled from the XML.
-
-- Performance: single pass over XML; for Process/Object we only scan each owner's
-  subtree and do NOT descend into nested owners (no bleeding, no rescans).
-
-- Formatting: we set borders/alignment like the surrounding columns, but we do
-  NOT propagate background fills to data cells (prevents header highlight bleed).
-  Validation cells still use green/red/orange fills.
-
-Requires: pandas, xlwings, openpyxl
+Fixes & behavior
+----------------
+- Inserts section columns exactly once (no duplicates).
+- Prevents header background "bleed": clears fill on the newly inserted column headers,
+  unmerges single-row merges at those header cells before writing header text.
+- Hard coded values: writes ALL detected paths/URLs (one per line), not capped.
+- Path detection: greedy drive path regex (C–Z) + UNC + http(s) URLs; no truncation like C:\T.
+- Owner-scoped traversal: for each <process> and <object>, scan only its subtree (without
+  descending into nested owners). So <object><process>…</process></object> => paths belong
+  to the PROCESS, not the object.
+- Common Object (BO): case-insensitive Yes/No using your .txt list.
+- Console prints: per-process/BO path counts and BO exception types for visibility.
+- Formatting: borders/alignment copied; background fills for data cells are cleared (no bleed).
 """
 
 import argparse
@@ -44,18 +27,13 @@ import pandas as pd
 import xlwings as xw
 from contextlib import contextmanager
 
-
 # ========================= XML helpers =========================
 
 def _local(tag: str) -> str:
     return tag.split('}', 1)[1] if tag.startswith('{') else tag
 
-
 def _iter_owner_nodes(owner: ET.Element) -> Iterable[ET.Element]:
-    """
-    Yield the owner and all descendants, but DO NOT descend into a nested <process> or <object>.
-    Prevents cross-contamination and saves time.
-    """
+    """Yield the owner and all descendants, but DO NOT descend into a nested <process> or <object>."""
     stack = [owner]
     while stack:
         node = stack.pop()
@@ -63,44 +41,18 @@ def _iter_owner_nodes(owner: ET.Element) -> Iterable[ET.Element]:
         for child in list(node):
             loc = _local(child.tag).lower()
             if loc in {"process", "object"} and child is not owner:
-                # stop descent into nested owners
                 continue
             stack.append(child)
 
-
-def extract_names_from_xml(xml_path: str, want: str) -> List[str]:
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    names: List[str] = []
-    for elem in root.iter():
-        if _local(elem.tag).casefold() == want.casefold():   # <- case-insensitive on tag
-            name_attr = elem.attrib.get('name') or elem.attrib.get('Name')
-            if name_attr:
-                names.append(name_attr.strip())
-    # ordered de-dupe
-    seen = set()
-    out: List[str] = []
-    for name in names:
-        if name not in seen:
-            seen.add(name); out.append(name)
-    return out
-
-
 def _read_published_value(proc_elem: ET.Element) -> Optional[str]:
-    """
-    Prefer <process published="..."> (any case), else fall back to child nodes:
-      <published>...</published>, <is-published>...</is-published>, <ispublished>...</ispublished>
-    Return 'True'/'False' for common booleans; otherwise the literal; None if not present.
-    """
-    # 1) attribute (accept different casings)
+    # attribute
     for attr_name in ("published", "Published", "PUBLISHED"):
         if attr_name in proc_elem.attrib:
             raw = (proc_elem.attrib.get(attr_name) or "").strip()
             break
     else:
         raw = None
-
-    # 2) child nodes if attribute missing/empty
+    # child nodes
     if not raw:
         for child in proc_elem.iter():
             tag = _local(child.tag).casefold()
@@ -108,10 +60,8 @@ def _read_published_value(proc_elem: ET.Element) -> Optional[str]:
                 raw = (child.text or "").strip()
                 if raw:
                     break
-
     if not raw:
         return None
-
     low = raw.casefold()
     if low in {"true", "1", "yes", "y"}:
         return "True"
@@ -119,16 +69,15 @@ def _read_published_value(proc_elem: ET.Element) -> Optional[str]:
         return "False"
     return raw
 
+# ================= Path/URL detection (robust, greedy) =================
 
-# ---- Path/URL detection -----------------------------------------------------
-
-# Drive paths: C: to Z: ; allow spaces inside, but not trailing space.
+# Drive paths C:.. to Z:.., greedy, allow spaces inside (not trailing)
 _PATH_DRIVE = re.compile(r"""
     \b
-    ([C-Z]:[\\/](?:[^<>:"|?\r\n]*?[^<>:"|?\s\r\n])?)
+    ([C-Z]:[\\/][^<>:"|?\r\n]*[^<>:"|?\s\r\n])
 """, re.IGNORECASE | re.VERBOSE)
 
-# UNC backslashes: \\server\share\path (allow spaces inside tokens)
+# UNC backslashes: \\server\share\path
 _PATH_UNC_BACK = re.compile(r"""
     \\\\
     [A-Za-z0-9._$-]+
@@ -150,89 +99,69 @@ _PATH_URL = re.compile(r"""
 def _find_paths_in_text(s: Optional[str]) -> List[str]:
     if not s:
         return []
-    t = _to_space(s)  # normalize NBSP/newlines to spaces (keeps slashes/backslashes)
+    t = _to_space(s)
     if not t:
         return []
-    if re.fullmatch(r"\[[^\]]+\]", t):  # ignore pure [Placeholders]
+    if re.fullmatch(r"\[[^\]]+\]", t):  # ignore placeholders like [X]
         return []
     hits = []
-
     for rx in (_PATH_DRIVE, _PATH_UNC_BACK, _PATH_UNC_FWD, _PATH_URL):
         hits.extend(m.group(0) for m in rx.finditer(t))
-
-    # de-dupe while preserving order
+    # de-dupe preserve order
     seen, out = set(), []
     for h in hits:
         if h not in seen:
             seen.add(h); out.append(h)
     return out
 
-
-# ---------- Environment variables via exposure / block ----------
+# ================= ENV vars & locals =================
 
 def extract_env_variables_from_xml(xml_path: str) -> List[str]:
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+    tree = ET.parse(xml_path); root = tree.getroot()
     names: List[str] = []
-
-    # Preferred: Data stage with exposure=Environment
+    # Preferred: Data stage exposure=Environment
     for stage in root.iter():
-        if _local(stage.tag) != "stage":
-            continue
-        if (stage.attrib.get("type") or "").strip().lower() != "data":
-            continue
+        if _local(stage.tag) != "stage": continue
+        if (stage.attrib.get("type") or "").strip().lower() != "data": continue
         name_attr = stage.attrib.get("name") or stage.attrib.get("Name")
-        if not name_attr:
-            continue
+        if not name_attr: continue
         exposure = None
         for child in stage:
             if _local(child.tag) == "exposure":
-                exposure = (child.text or "").strip().lower()
-                break
+                exposure = (child.text or "").strip().lower(); break
         if exposure == "environment":
             names.append(name_attr.strip())
 
-    # Fallback container/block
+    # Fallback container
     targets = {"environment variables", "environmnet variables"}
     for stage in root.iter():
-        if _local(stage.tag) != "stage":
-            continue
+        if _local(stage.tag) != "stage": continue
         stage_name = (stage.attrib.get("name") or "").strip()
         if stage_name.casefold() in targets:
-            child_count = 0
             for sub in stage:
-                if _local(sub.tag) != "stage":
-                    continue
-                child_count += 1
+                if _local(sub.tag) != "stage": continue
                 sub_name = (sub.attrib.get("name") or sub.attrib.get("Name") or "").strip()
                 if sub_name and sub_name.casefold() not in targets:
                     names.append(sub_name)
 
-    # de-dupe
     seen, out = set(), []
     for n in names:
         if n not in seen:
             seen.add(n); out.append(n)
     return out
 
-
 def extract_local_data_item_names(xml_path: str) -> List[str]:
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+    tree = ET.parse(xml_path); root = tree.getroot()
     locals_only: List[str] = []
     for stage in root.iter():
-        if _local(stage.tag) != "stage":
-            continue
-        if (stage.attrib.get("type") or "").strip().lower() != "data":
-            continue
+        if _local(stage.tag) != "stage": continue
+        if (stage.attrib.get("type") or "").strip().lower() != "data": continue
         name_attr = stage.attrib.get("name") or stage.attrib.get("Name")
-        if not name_attr:
-            continue
+        if not name_attr: continue
         exposure = None
         for child in stage:
             if _local(child.tag) == "exposure":
-                exposure = (child.text or "").strip().lower()
-                break
+                exposure = (child.text or "").strip().lower(); break
         if exposure != "environment":
             locals_only.append(name_attr.strip())
 
@@ -242,8 +171,7 @@ def extract_local_data_item_names(xml_path: str) -> List[str]:
             seen.add(n); out.append(n)
     return out
 
-
-# ---------- Hardcoded literal finder (optional CSV) -------------------------
+# ================= Optional: hardcoded literal CSV (unchanged) ================
 
 _TEXTY_TAGS = {"initialvalue", "expression", "text", "sql", "note",
                "url", "path", "filename", "address", "value"}
@@ -252,28 +180,19 @@ _TEXTY_ATTRS = {"value", "expression", "text", "sql", "url", "address", "path",
 
 def _looks_hardcoded(val: str, min_len: int = 3) -> bool:
     t = re.sub(r"\s+", " ", (val or "")).strip()
-    if not t:
-        return False
+    if not t: return False
     low = t.casefold()
-    if low in {"true", "false", "yes", "no", "null", "none"}:
-        return False
-    if re.fullmatch(r"\[[^\]]+\]", t):
-        return False
-    if re.fullmatch(r"[-+]?\d+(\.\d+)?", t):
-        return False
-    if any(len(q.strip()) >= min_len for q in re.findall(r'"([^"]+)"', t)):
-        return True
-    if "://" in t or re.search(r"[\\/]|\w+@\w+", t):
-        return True
-    if len(t) >= max(8, min_len) and re.search(r"[A-Za-z]", t) and re.search(r"\d", t):
-        return True
-    if len(t) >= min_len and " " in t and not re.fullmatch(r"[A-Za-z0-9_ ]+", t):
-        return True
+    if low in {"true", "false", "yes", "no", "null", "none"}: return False
+    if re.fullmatch(r"\[[^\]]+\]", t): return False
+    if re.fullmatch(r"[-+]?\d+(\.\d+)?", t): return False
+    if any(len(q.strip()) >= min_len for q in re.findall(r'"([^"]+)"', t)): return True
+    if "://" in t or re.search(r"[\\/]|\w+@\w+", t): return True
+    if len(t) >= max(8, min_len) and re.search(r"[A-Za-z]", t) and re.search(r"\d", t): return True
+    if len(t) >= min_len and " " in t and not re.fullmatch(r"[A-Za-z0-9_ ]+", t): return True
     return len(t) >= 20
 
 def find_hardcoded_literals(xml_path: str, min_len: int = 3) -> List[Dict[str, str]]:
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+    tree = ET.parse(xml_path); root = tree.getroot()
     parent_map = {c: p for p in root.iter() for c in p}
 
     def _context(elem: ET.Element) -> str:
@@ -304,17 +223,13 @@ def find_hardcoded_literals(xml_path: str, min_len: int = 3) -> List[Dict[str, s
                 hits.append({"where": _context(elem), "tag_or_attr": f"@{an}", "value": av})
     return hits
 
-
 # ==================== normalization / tokens ====================
 
 NBSPS = ("\u00A0", "\u2007", "\u202F")
-
 def _to_space(value) -> str:
-    if value is None:
-        return ""
+    if value is None: return ""
     text = str(value)
-    for nb in NBSPS:
-        text = text.replace(nb, " ")
+    for nb in NBSPS: text = text.replace(nb, " ")
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
     return text
@@ -324,20 +239,13 @@ def _norm(value) -> str:
 
 def _cell_is_single_letter_marker(cell_val: str) -> bool:
     v = _norm(cell_val)
-    if not v:
-        return False
-    if len(v) == 1 and v.isalpha():
-        return True
-    if len(v) == 2 and v[0].isalpha() and v[1] in ('.', ':'):
-        return True
+    if not v: return False
+    if len(v) == 1 and v.isalpha(): return True
+    if len(v) == 2 and v[0].isalpha() and v[1] in ('.', ':'): return True
     return False
 
-def _row_tokens(row: pd.Series) -> List[str]:
-    return [_norm(c) for c in row]
-
-def _excel_row(idx0: int) -> int:
-    return idx0 + 1
-
+def _row_tokens(row: pd.Series) -> List[str]: return [_norm(c) for c in row]
+def _excel_row(idx0: int) -> int: return idx0 + 1
 
 # ===================== formatting / borders =====================
 
@@ -362,8 +270,7 @@ def _clone_borders(from_cell_api, to_cell_api) -> None:
         pass
 
 def _apply_borders_like_left(ws, row_1based: int, col_1based: int) -> None:
-    if col_1based <= 1:
-        return
+    if col_1based <= 1: return
     try:
         left = ws.api.Cells(row_1based, col_1based - 1)
         dst = ws.api.Cells(row_1based, col_1based)
@@ -374,11 +281,21 @@ def _apply_borders_like_left(ws, row_1based: int, col_1based: int) -> None:
 def clear_fill_preserve_borders(ws, row_1based: int, col_1based: int) -> None:
     try:
         dst = ws.api.Cells(row_1based, col_1based)
-        dst.Interior.Pattern = -4142
+        dst.Interior.Pattern = -4142  # xlPatternNone
         dst.Interior.TintAndShade = 0
         dst.Interior.PatternTintAndShade = 0
         if row_1based > 1:
             _clone_borders(ws.api.Cells(row_1based - 1, col_1based), dst)
+    except Exception:
+        pass
+
+def _unmerge_if_single_row_merge(ws, row_1based: int, col_1based: int) -> None:
+    try:
+        cell = ws.api.Cells(row_1based, col_1based)
+        if cell.MergeCells:
+            area = cell.MergeArea
+            if int(area.Rows.Count) == 1:  # horizontal merge on this row
+                area.UnMerge()
     except Exception:
         pass
 
@@ -393,6 +310,51 @@ def insert_row_with_style(ws, row_1based: int) -> None:
     except Exception:
         pass
 
+def _ensure_min_col_width(ws, cols: List[int], min_width: float = 18.0) -> None:
+    for c in cols:
+        try:
+            col = ws.api.Columns(c)
+            col.AutoFit()
+            if float(col.ColumnWidth) < min_width:
+                col.ColumnWidth = min_width
+        except Exception:
+            pass
+
+def _wrap_columns_and_autofit_rows(ws, start_row_1based: int, end_row_1based: int, cols: List[int]) -> None:
+    if start_row_1based > end_row_1based: return
+    for c in cols:
+        try:
+            rng = ws.api.Range(ws.api.Cells(start_row_1based, c), ws.api.Cells(end_row_1based, c))
+            rng.WrapText = True
+        except Exception:
+            pass
+    try:
+        ws.api.Rows(f"{start_row_1based}:{end_row_1based}").AutoFit()
+    except Exception:
+        pass
+
+def _apply_alignment_like_header_for_rows(ws, header_row_1based: int, start_row_1based: int, end_row_1based: int, cols: List[int]) -> None:
+    if start_row_1based > end_row_1based: return
+    for c in cols:
+        try:
+            hdr = ws.api.Cells(header_row_1based, c)
+            rng = ws.api.Range(ws.api.Cells(start_row_1based, c), ws.api.Cells(end_row_1based, c))
+            rng.HorizontalAlignment = hdr.HorizontalAlignment
+            rng.VerticalAlignment = hdr.VerticalAlignment
+        except Exception:
+            pass
+
+def _header_index_map(ws, header_row_1based: int) -> Dict[str, int]:
+    last_col = ws.used_range.last_cell.column
+    vals = ws.range((header_row_1based, 1), (header_row_1based, last_col)).value
+    if isinstance(vals, list) and len(vals) and isinstance(vals[0], list):
+        vals = vals[0]
+    out = {}
+    for i, v in enumerate(vals or [], start=1):
+        key = _norm(v)
+        if key and key not in out:
+            out[key] = i
+    return out
 
 # ===================== small helpers / parsing =====================
 
@@ -406,7 +368,6 @@ def _last_nonempty_col_index(row: pd.Series) -> int:
 def _extract_int(text: str) -> Optional[int]:
     match = re.search(r"\d+", _to_space(text))
     return int(match.group(0)) if match else None
-
 
 # ====================== dynamic section model ======================
 
@@ -439,7 +400,6 @@ def find_dynamic_markers(df: pd.DataFrame) -> List[Dict[str, Any]]:
         markers.append({"row": row_index, "type": label})
     return markers
 
-
 # ===================== header & column resolvers =====================
 
 def find_header_after_marker(df: pd.DataFrame, marker_row: int, section_type: str, lookahead: int = 80) -> Optional[int]:
@@ -448,14 +408,11 @@ def find_header_after_marker(df: pd.DataFrame, marker_row: int, section_type: st
         tokens = _row_tokens(df.iloc[row_index])
         if all(v == "" for v in tokens):
             continue
-
         if section_type == "bp_scripts_check":
             return row_index
-
         if section_type in ("process", "business_object", "environment_variable_prod"):
             if any("name" in v for v in tokens):
                 return row_index
-
         elif section_type == "work_queue":
             has_wq_name = any(("work queue name" in v) for v in tokens)
             has_key_name = any(("key name" in v) for v in tokens)
@@ -463,25 +420,21 @@ def find_header_after_marker(df: pd.DataFrame, marker_row: int, section_type: st
                 return row_index
     return None
 
-
 def pick_columns(df: pd.DataFrame, header_row: int, section_type: str) -> Dict[str, Optional[int]]:
     normed = [(_norm(v), idx) for idx, v in df.iloc[header_row].items()]
-
-    # Validation column (reuse or next empty to the right)
+    # Validation column
     validation_col = None
     for text, idx in normed:
         if text == "validation":
             validation_col = idx; break
     if validation_col is None:
         validation_col = _last_nonempty_col_index(df.iloc[header_row]) + 1
-
-    # No. (dot-insensitive)
+    # No.
     no_col = None
     for text, idx in normed:
         if text == "no" or text == "no." or text.startswith("no."):
             no_col = idx; break
-
-    # Check (optional)
+    # Check
     check_col = None
     for text, idx in normed:
         if "check" in text:
@@ -497,7 +450,7 @@ def pick_columns(df: pd.DataFrame, header_row: int, section_type: str) -> Dict[s
                 name_col = idx; break
         return {"name_col": name_col, "no_col": no_col, "check_col": check_col, "validation_col": validation_col}
 
-    # work_queue (phrase-based)
+    # work_queue
     wq_name_col = None
     for text, idx in normed:
         if "work queue name" in text:
@@ -508,40 +461,24 @@ def pick_columns(df: pd.DataFrame, header_row: int, section_type: str) -> Dict[s
             key_col = idx; break
     if wq_name_col is None:
         for text, idx in normed:
-            if text == "name":  # last-resort fallback
+            if text == "name":
                 wq_name_col = idx; break
 
-    return {
-        "wq_name_col": wq_name_col,
-        "key_col": key_col,
-        "no_col": no_col,
-        "encrypted_col": None,
-        "check_col": check_col,
-        "validation_col": validation_col,
-    }
-
+    return {"wq_name_col": wq_name_col, "key_col": key_col, "no_col": no_col,
+            "encrypted_col": None, "check_col": check_col, "validation_col": validation_col}
 
 # ======================= planning per section =======================
 
 def _row_has_any_nonblank(series: pd.Series) -> bool:
     return any(_to_space(v).strip() != "" for v in list(series.values))
 
-def build_plan_process_like(
-    df: pd.DataFrame,
-    header_row: int,
-    name_col: int,
-    no_col: Optional[int],
-    check_col: Optional[int],
-    validation_col: int,
-    xml_names: List[str],
-    next_marker_row: Optional[int],
-) -> Dict[str, Any]:
+def build_plan_process_like(df: pd.DataFrame, header_row: int, name_col: int,
+                            no_col: Optional[int], check_col: Optional[int], validation_col: int,
+                            xml_names: List[str], next_marker_row: Optional[int]) -> Dict[str, Any]:
     content_start = header_row + 1
     content_end = next_marker_row if next_marker_row is not None else len(df)
-
     coarse = df.iloc[content_start:content_end].copy().reset_index(drop=True)
 
-    # Find last relevant row
     last_rel_by_no = None
     max_no_value = None
     if no_col is not None and no_col < coarse.shape[1]:
@@ -553,12 +490,10 @@ def build_plan_process_like(
             v = _extract_int(coarse.iat[row_index, no_col])
             if v is not None:
                 last_rel_by_no = row_index; break
-
     last_rel_by_any = None
     for row_index in range(len(coarse) - 1, -1, -1):
         if _row_has_any_nonblank(coarse.iloc[row_index]):
             last_rel_by_any = row_index; break
-
     last_rel_by_name = None
     if name_col < coarse.shape[1]:
         for row_index in range(len(coarse) - 1, -1, -1):
@@ -579,7 +514,6 @@ def build_plan_process_like(
     row_names = section_df[name_col].astype(str).fillna("").apply(_to_space).str.strip().tolist()
 
     xml_set = {x.strip() for x in xml_names}
-
     statuses: List[str] = []
     for nm in row_names:
         if not nm:
@@ -605,7 +539,7 @@ def build_plan_process_like(
             fillable_rel.append(rel_index)
 
     last_abs_index = content_start + (true_end_rel_excl - 1) if true_end_rel_excl > 0 else header_row
-    insert_at_excel_row = last_abs_index + 2  # Excel is 1-based
+    insert_at_excel_row = last_abs_index + 2
 
     if max_no_value is not None:
         next_no = max_no_value + 1
@@ -613,37 +547,19 @@ def build_plan_process_like(
         nonblank_names = sum(1 for v in row_names if v)
         next_no = nonblank_names + 1 if no_col is not None else None
 
-    return {
-        "type": None,
-        "header_row": header_row,
-        "header_excel_row": header_row + 1,
-        "start_row_excel": content_start + 1,
-        "row_count": true_end_abs_excl - content_start,
-        "insert_at_excel_row": insert_at_excel_row,
-        "name_col": name_col,
-        "no_col": no_col,
-        "check_col": check_col,
-        "validation_col": validation_col,
-        "excel_names": row_names,
-        "validation_vals": statuses,
-        "missing": missing,
-        "fillable_rel": fillable_rel,
-        "next_no": next_no,
-        "inserted_rows": 0,
-    }
+    return {"type": None, "header_row": header_row, "header_excel_row": header_row + 1,
+            "start_row_excel": content_start + 1, "row_count": true_end_abs_excl - content_start,
+            "insert_at_excel_row": insert_at_excel_row, "name_col": name_col,
+            "no_col": no_col, "check_col": check_col, "validation_col": validation_col,
+            "excel_names": row_names, "validation_vals": statuses, "missing": missing,
+            "fillable_rel": fillable_rel, "next_no": next_no, "inserted_rows": 0}
 
-
-def build_plan_workqueue(
-    df: pd.DataFrame,
-    header_row: int,
-    cols: Dict[str, int],
-    xml_wq: Dict[str, Dict[str, Optional[str]]],
-    next_marker_row: Optional[int],
-) -> Dict[str, Any]:
+def build_plan_workqueue(df: pd.DataFrame, header_row: int, cols: Dict[str, int],
+                         xml_wq: Dict[str, Dict[str, Optional[str]]],
+                         next_marker_row: Optional[int]) -> Dict[str, Any]:
     wq_name_col = cols["wq_name_col"]
     content_start = header_row + 1
     content_end = next_marker_row if next_marker_row is not None else len(df)
-
     coarse = df.iloc[content_start:content_end].copy().reset_index(drop=True)
 
     last_rel_by_no = None
@@ -711,7 +627,6 @@ def build_plan_workqueue(
 
     last_abs_index = content_start + (true_end_rel_excl - 1) if true_end_rel_excl > 0 else header_row
     insert_at_excel_row = last_abs_index + 2
-
     if max_no_value is not None:
         next_no = max_no_value + 1
     else:
@@ -721,62 +636,36 @@ def build_plan_workqueue(
     print(f"[WQ] Content rows Excel {_excel_row(content_start)}..{_excel_row(true_end_abs_excl-1)}; "
           f"existing={len(row_names)}; missing_from_excel={len(missing)}")
 
-    return {
-        "type": None,
-        "header_row": header_row,
-        "header_excel_row": header_row + 1,
-        "start_row_excel": content_start + 1,
-        "row_count": true_end_abs_excl - content_start,
-        "insert_at_excel_row": insert_at_excel_row,
-        "wq_name_col": wq_name_col,
-        "key_col": cols["key_col"],
-        "no_col": cols["no_col"],
-        "check_col": cols["check_col"],
-        "validation_col": cols["validation_col"],
-        "excel_names": row_names,
-        "validation_vals": statuses,
-        "missing": missing,
-        "fillable_rel": fillable_rel,
-        "next_no": next_no,
-        "inserted_rows": 0,
-    }
+    return {"type": None, "header_row": header_row, "header_excel_row": header_row + 1,
+            "start_row_excel": content_start + 1, "row_count": true_end_abs_excl - content_start,
+            "insert_at_excel_row": insert_at_excel_row, "wq_name_col": wq_name_col,
+            "key_col": cols["key_col"], "no_col": cols["no_col"], "check_col": cols["check_col"],
+            "validation_col": cols["validation_col"], "excel_names": row_names,
+            "validation_vals": statuses, "missing": missing, "fillable_rel": fillable_rel,
+            "next_no": next_no, "inserted_rows": 0}
 
-
-def build_plan_bp_scripts_check(
-    df: pd.DataFrame,
-    header_row: int,
-    cols: Dict[str, Optional[int]],
-    next_marker_row: Optional[int],
-) -> Dict[str, Any]:
+def build_plan_bp_scripts_check(df: pd.DataFrame, header_row: int,
+                                cols: Dict[str, Optional[int]],
+                                next_marker_row: Optional[int]) -> Dict[str, Any]:
     content_start = header_row + 1
     content_end = next_marker_row if next_marker_row is not None else len(df)
     section_df = df.iloc[content_start:content_end].copy().reset_index(drop=True)
 
     target_phrase_norm = _norm("Is your main process published?")
     target_rel = None
-
     for rel_index in range(section_df.shape[0]):
         row = section_df.iloc[rel_index]
         if any(_norm(_to_space(val).strip()) == target_phrase_norm for val in list(row.values)):
             target_rel = rel_index; break
 
-    return {
-        "type": None,
-        "header_row": header_row,
-        "header_excel_row": header_row + 1,
-        "start_row_excel": content_start + 1,
-        "row_count": section_df.shape[0],
-        "validation_col": cols["validation_col"],
-        "target_row_rel": target_rel,
-        "validation_vals": [""] * section_df.shape[0],
-        "inserted_rows": 0,
-    }
-
+    return {"type": None, "header_row": header_row, "header_excel_row": header_row + 1,
+            "start_row_excel": content_start + 1, "row_count": section_df.shape[0],
+            "validation_col": cols["validation_col"], "target_row_rel": target_rel,
+            "validation_vals": [""] * section_df.shape[0], "inserted_rows": 0}
 
 # ========================= writers & utilities =========================
 
 def _unmerge_cell_if_rowspan(ws, row_1based: int, col_1based: int) -> None:
-    """If the cell belongs to a MergeArea spanning multiple rows, unmerge it."""
     try:
         cell = ws.api.Cells(row_1based, col_1based)
         if cell.MergeCells:
@@ -791,68 +680,20 @@ def _unmerge_verticals_in_section(ws, start_row_1based: int, end_row_1based: int
         for c in col_1based_list:
             _unmerge_cell_if_rowspan(ws, r, c)
 
-def _ensure_min_col_width(ws, cols: List[int], min_width: float = 18.0) -> None:
-    for c in cols:
-        try:
-            col = ws.api.Columns(c)
-            col.AutoFit()
-            if float(col.ColumnWidth) < min_width:
-                col.ColumnWidth = min_width
-        except Exception:
-            pass
-
-def _wrap_columns_and_autofit_rows(ws, start_row_1based: int, end_row_1based: int, cols: List[int]) -> None:
-    if start_row_1based > end_row_1based:
-        return
-    for c in cols:
-        try:
-            rng = ws.api.Range(ws.api.Cells(start_row_1based, c), ws.api.Cells(end_row_1based, c))
-            rng.WrapText = True
-        except Exception:
-            pass
-    try:
-        ws.api.Rows(f"{start_row_1based}:{end_row_1based}").AutoFit()
-    except Exception:
-        pass
-
-def _apply_alignment_like_header_for_rows(ws, header_row_1based: int, start_row_1based: int, end_row_1based: int, cols: List[int]) -> None:
-    if start_row_1based > end_row_1based:
-        return
-    for c in cols:
-        try:
-            hdr = ws.api.Cells(header_row_1based, c)
-            rng = ws.api.Range(ws.api.Cells(start_row_1based, c), ws.api.Cells(end_row_1based, c))
-            rng.HorizontalAlignment = hdr.HorizontalAlignment
-            rng.VerticalAlignment = hdr.VerticalAlignment
-        except Exception:
-            pass
-
-def _header_index_map(ws, header_row_1based: int) -> Dict[str, int]:
-    last_col = ws.used_range.last_cell.column
-    vals = ws.range((header_row_1based, 1), (header_row_1based, last_col)).value
-    if isinstance(vals, list) and len(vals) and isinstance(vals[0], list):
-        vals = vals[0]
-    out = {}
-    for i, v in enumerate(vals or [], start=1):
-        key = _norm(v)
-        if key and key not in out:
-            out[key] = i
-    return out
-
 def write_existing_validation(ws, start_row_excel: int, validation_col0: int, statuses: List[str]) -> None:
     validation_col_1based = validation_col0 + 1
     for offset, status in enumerate(statuses):
         row_1based = start_row_excel + offset
         _unmerge_cell_if_rowspan(ws, row_1based, validation_col_1based)
         _apply_borders_like_left(ws, row_1based, validation_col_1based)  # borders only
-        ws.range((row_1based, validation_col_1based)).value = status if status else ""
+        cell = ws.range((row_1based, validation_col_1based))
+        cell.value = status if status else ""
         if status == "Exists":
-            ws.range((row_1based, validation_col_1based)).color = COLOR_GREEN
+            cell.color = COLOR_GREEN
         elif status == "Does not exist":
-            ws.range((row_1based, validation_col_1based)).color = COLOR_RED
+            cell.color = COLOR_RED
         else:
-            ws.range((row_1based, validation_col_1based)).color = None
-
+            cell.color = None
 
 def fill_into_blanks_name_table(ws, plan: Dict[str, Any], names_to_place: List[str]) -> int:
     consumed = 0
@@ -863,14 +704,12 @@ def fill_into_blanks_name_table(ws, plan: Dict[str, Any], names_to_place: List[s
     next_no = plan["next_no"]
 
     for rel_index in plan["fillable_rel"]:
-        if consumed >= len(names_to_place):
-            break
+        if consumed >= len(names_to_place): break
         row_1based = plan["start_row_excel"] + rel_index
         new_name = names_to_place[consumed]
 
         for col1 in [name_col_1based, validation_col_1based, no_col_1based or 0, check_col_1based or 0]:
-            if col1:
-                _unmerge_cell_if_rowspan(ws, row_1based, col1)
+            if col1: _unmerge_cell_if_rowspan(ws, row_1based, col1)
 
         ws.range((row_1based, name_col_1based)).value = new_name
 
@@ -895,11 +734,8 @@ def fill_into_blanks_name_table(ws, plan: Dict[str, Any], names_to_place: List[s
     plan["next_no"] = next_no
     return consumed
 
-
 def insert_new_rows_name_table(ws, plan: Dict[str, Any], remaining: List[str]) -> int:
-    if not remaining:
-        return 0
-
+    if not remaining: return 0
     name_col_1based = plan["name_col"] + 1
     validation_col_1based = plan["validation_col"] + 1
     no_col_1based = plan["no_col"] + 1 if plan["no_col"] is not None else None
@@ -911,8 +747,7 @@ def insert_new_rows_name_table(ws, plan: Dict[str, Any], remaining: List[str]) -
         insert_row_with_style(ws, row_1based)
 
         for col1 in [name_col_1based, validation_col_1based, no_col_1based or 0, check_col_1based or 0]:
-            if col1:
-                _unmerge_cell_if_rowspan(ws, row_1based, col1)
+            if col1: _unmerge_cell_if_rowspan(ws, row_1based, col1)
 
         ws.range((row_1based, name_col_1based)).value = new_name
 
@@ -930,7 +765,6 @@ def insert_new_rows_name_table(ws, plan: Dict[str, Any], remaining: List[str]) -
     plan["next_no"] = next_no
     plan["inserted_rows"] = (plan.get("inserted_rows", 0) or 0) + len(remaining)
     return len(remaining)
-
 
 def fill_into_blanks_wq(ws, plan: Dict[str, Any], names_to_place: List[str], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
     consumed = 0
@@ -942,14 +776,12 @@ def fill_into_blanks_wq(ws, plan: Dict[str, Any], names_to_place: List[str], xml
     next_no = plan["next_no"]
 
     for rel_index in plan["fillable_rel"]:
-        if consumed >= len(names_to_place):
-            break
+        if consumed >= len(names_to_place): break
         row_1based = plan["start_row_excel"] + rel_index
         new_name = names_to_place[consumed]
 
         for col1 in [name_col_1based, validation_col_1based, key_col_1based or 0, no_col_1based or 0, check_col_1based or 0]:
-            if col1:
-                _unmerge_cell_if_rowspan(ws, row_1based, col1)
+            if col1: _unmerge_cell_if_rowspan(ws, row_1based, col1)
 
         ws.range((row_1based, name_col_1based)).value = new_name
         if key_col_1based is not None:
@@ -978,11 +810,8 @@ def fill_into_blanks_wq(ws, plan: Dict[str, Any], names_to_place: List[str], xml
     plan["next_no"] = next_no
     return consumed
 
-
 def insert_new_rows_wq(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
-    if not remaining:
-        return 0
-
+    if not remaining: return 0
     name_col_1based = plan["wq_name_col"] + 1
     key_col_1based = plan["key_col"] + 1 if plan.get("key_col") is not None else None
     validation_col_1based = plan["validation_col"] + 1
@@ -995,11 +824,9 @@ def insert_new_rows_wq(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: D
         insert_row_with_style(ws, row_1based)
 
         for col1 in [name_col_1based, validation_col_1based, key_col_1based or 0, no_col_1based or 0, check_col_1based or 0]:
-            if col1:
-                _unmerge_cell_if_rowspan(ws, row_1based, col1)
+            if col1: _unmerge_cell_if_rowspan(ws, row_1based, col1)
 
         ws.range((row_1based, name_col_1based)).value = new_name
-
         if key_col_1based is not None:
             key_val = (xml_wq.get(new_name, {}) or {}).get("key") or ""
             if key_val:
@@ -1020,10 +847,8 @@ def insert_new_rows_wq(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: D
     plan["inserted_rows"] = (plan.get("inserted_rows", 0) or 0) + len(remaining)
     return len(remaining)
 
-
 def adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
-    if plan.get("key_col") is None:
-        return 0
+    if plan.get("key_col") is None: return 0
     name_col_1based = plan["wq_name_col"] + 1
     key_col_1based = plan["key_col"] + 1
     validation_col_1based = plan["validation_col"] + 1
@@ -1048,7 +873,6 @@ def adjust_wq_key_validation(ws, plan: Dict[str, Any], xml_wq: Dict[str, Dict[st
             ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
             mismatches += 1
     return mismatches
-
 
 # ---------- ENV(PROD) post-write validator ----------
 
@@ -1076,10 +900,8 @@ def adjust_env_local_validation(ws, plan: Dict[str, Any], local_data_item_names:
             hits += 1
     return hits
 
-
 def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], all_processes_published: bool) -> None:
-    if plan.get("target_row_rel") is None:
-        return
+    if plan.get("target_row_rel") is None: return
     row_1based = plan["start_row_excel"] + plan["target_row_rel"]
     validation_col_1based = plan["validation_col"] + 1
     _apply_borders_like_left(ws, row_1based, validation_col_1based)
@@ -1090,13 +912,17 @@ def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], all_processes_pu
         ws.range((row_1based, validation_col_1based)).value = "No"
         ws.range((row_1based, validation_col_1based)).color = COLOR_RED
 
-
 # ---------- Process & BO extras (insert columns, write values) ----------
 
 _ALLOWED_EXC = {"System Exception", "Business Exception"}
 
+def _prepare_new_header_cell(ws, row_1based: int, col_1based: int) -> None:
+    # Unmerge single-row merges and clear fill so header highlight doesn't bleed
+    _unmerge_if_single_row_merge(ws, row_1based, col_1based)
+    clear_fill_preserve_borders(ws, row_1based, col_1based)
+
 def _insert_process_extra_columns(ws, plan: Dict[str, Any]) -> None:
-    """Insert 3 columns before Validation, then shift indices."""
+    """Insert 3 columns BEFORE Validation and shift indices. Also clear header fills on the new cells."""
     vcol_1 = plan["validation_col"] + 1
     for _ in range(3):
         try:
@@ -1109,7 +935,11 @@ def _insert_process_extra_columns(ws, plan: Dict[str, Any]) -> None:
     plan["hardcoded_col"]  = base0 + 1
     plan["exception_col"]  = base0 + 2
     plan["validation_col"] = base0 + 3
-    print(f"[PROCESS] Inserted extra columns before Validation at Excel col {vcol_1} (1-based).")
+
+    # Header-row cleanup (no background bleed)
+    row = plan["header_excel_row"]
+    for col0 in (plan["published_col"], plan["hardcoded_col"], plan["exception_col"]):
+        _prepare_new_header_cell(ws, row, col0 + 1)
 
 def _write_process_extra_headers(ws, plan: Dict[str, Any]) -> None:
     row = plan["header_excel_row"]
@@ -1120,7 +950,6 @@ def _write_process_extra_headers(ws, plan: Dict[str, Any]) -> None:
         ws.range((row, col1)).value = text
 
 def _insert_bo_extra_columns(ws, plan: Dict[str, Any]) -> None:
-    """Insert 3 columns before Validation, then shift indices."""
     vcol_1 = plan["validation_col"] + 1
     for _ in range(3):
         try:
@@ -1133,40 +962,26 @@ def _insert_bo_extra_columns(ws, plan: Dict[str, Any]) -> None:
     plan["bo_hardcoded_col"] = base0 + 1
     plan["bo_exception_col"] = base0 + 2
     plan["validation_col"]   = base0 + 3
-    print(f"[BO] Inserted extra columns before Validation at Excel col {vcol_1} (1-based).")
+
+    row = plan["header_excel_row"]
+    for col0 in (plan["bo_common_col"], plan["bo_hardcoded_col"], plan["bo_exception_col"]):
+        _prepare_new_header_cell(ws, row, col0 + 1)
 
 def _write_bo_extra_headers(ws, plan: Dict[str, Any]) -> None:
     row = plan["header_excel_row"]
-    labels = [
-        ("Common Object",    plan["bo_common_col"] + 1),
-        ("Hard coded values", plan["bo_hardcoded_col"] + 1),
-        ("Exception Types",  plan["bo_exception_col"] + 1),
-    ]
+    labels = [("Common Object",    plan["bo_common_col"] + 1),
+              ("Hard coded values", plan["bo_hardcoded_col"] + 1),
+              ("Exception Types",  plan["bo_exception_col"] + 1)]
     for text, col1 in labels:
         ws.range((row, col1)).value = text
 
-
-def _join_paths_for_cell(paths: List[str]) -> str:
-    """Join all paths with newlines. Warn if close to Excel's per-cell limit (~32,767 chars)."""
-    if not paths:
-        return ""
-    joined = "\n".join(paths)
-    if len(joined) > 30000:
-        print(f"⚠️  Joined paths text is {len(joined)} chars; Excel may truncate beyond ~32767.")
-    return joined
-
-
 def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str, Any]]) -> None:
-    # Case-sensitive name matching; only whitespace normalised
-    meta_ws = { _to_space(k).strip(): v for k, v in (proc_meta or {}).items() }
-
     name_col_1 = plan["name_col"] + 1
     pub_col_1  = plan["published_col"] + 1
     hard_col_1 = plan["hardcoded_col"] + 1
     exc_col_1  = plan["exception_col"] + 1
 
     total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
-
     cols_to_unmerge = [name_col_1, pub_col_1, hard_col_1, exc_col_1, plan["validation_col"] + 1]
     if plan.get("no_col") is not None:    cols_to_unmerge.append(plan["no_col"] + 1)
     if plan.get("check_col") is not None: cols_to_unmerge.append(plan["check_col"] + 1)
@@ -1183,51 +998,41 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
 
         if not nm:
             continue
-
-        meta = proc_meta.get(nm) or meta_ws.get(nm)
-        if meta is None:
+        meta = proc_meta.get(nm) or {k: v for k, v in proc_meta.items() if _to_space(k).strip() == nm}
+        if not meta:
             continue
 
-        # Published status
-        pub = meta.get("published")
-        if pub is not None:
-            ws.range((row, pub_col_1)).value = pub
+        if meta.get("published") is not None:
+            ws.range((row, pub_col_1)).value = meta.get("published")
 
-        # Hard coded values: ALL paths, newline-separated
-        paths = list(meta.get("paths") or meta.get("path_samples") or [])
-        ws.range((row, hard_col_1)).value = _join_paths_for_cell(paths)
-        print(f"[PROC] {nm}: wrote {len(paths)} path(s) to Excel.")
+        # ALL paths, one per line
+        paths = list(meta.get("paths") or [])
+        if paths:
+            ws.range((row, hard_col_1)).value = "\n".join(paths)
 
-        # Exception types (only values containing "Exception")
         raw_types = set(meta.get("exception_types") or [])
         filtered = [t for t in sorted(raw_types) if "exception" in t.casefold()]
         if filtered:
             unknown = [t for t in filtered if t not in _ALLOWED_EXC]
-            if unknown:
-                ws.range((row, exc_col_1)).value = f"Found unknown exception types: {', '.join(unknown)}"
-            else:
-                ws.range((row, exc_col_1)).value = ", ".join(filtered)
+            ws.range((row, exc_col_1)).value = (
+                f"Found unknown exception types: {', '.join(unknown)}" if unknown
+                else ", ".join(filtered)
+            )
 
-
-def write_bo_extras(
-    ws,
-    plan: Dict[str, Any],
-    obj_meta: Dict[str, Dict[str, Any]],
-    common_objects: Set[str],
-) -> None:
+def write_bo_extras(ws, plan: Dict[str, Any], obj_meta: Dict[str, Dict[str, Any]], common_objects: Set[str]) -> None:
     name_col_1 = plan["name_col"] + 1
     common_col_1 = plan["bo_common_col"] + 1
     hard_col_1   = plan["bo_hardcoded_col"] + 1
     exc_col_1    = plan["bo_exception_col"] + 1
 
     total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
-
     cols_to_unmerge = [name_col_1, common_col_1, hard_col_1, exc_col_1, plan["validation_col"] + 1]
     if plan.get("no_col") is not None:    cols_to_unmerge.append(plan["no_col"] + 1)
     if plan.get("check_col") is not None: cols_to_unmerge.append(plan["check_col"] + 1)
     _unmerge_verticals_in_section(ws, plan["start_row_excel"], plan["start_row_excel"] + total_rows - 1, cols_to_unmerge)
 
-    meta_ws = { _to_space(k).strip(): v for k, v in (obj_meta or {}).items() }
+    # Case-sensitive Common Object match
+    common_set = set(common_objects or set())
 
     for offset in range(total_rows):
         row = plan["start_row_excel"] + offset
@@ -1241,36 +1046,31 @@ def write_bo_extras(
         if not nm:
             continue
 
-        # Common Object? (case-sensitive)
-        if common_objects:
-            ws.range((row, common_col_1)).value = "Yes" if nm in common_objects else "No"
+        # Common Object: Yes/No
+        if common_set:
+            ws.range((row, common_col_1)).value = "Yes" if nm in common_set else "No"
 
-        meta = (obj_meta or {}).get(nm) or meta_ws.get(nm)
+        meta = obj_meta.get(nm) or {k: v for k, v in obj_meta.items() if _to_space(k).strip() == nm}
+        meta = meta if isinstance(meta, dict) else None
         if not meta:
-            print(f"[BO] {nm}: no metadata gathered (no paths / exceptions).")
             continue
 
-        # Hard coded values: ALL paths, newline-separated
-        paths = list(meta.get("paths") or meta.get("path_samples") or [])
-        ws.range((row, hard_col_1)).value = _join_paths_for_cell(paths)
-        print(f"[BO] {nm}: wrote {len(paths)} path(s) to Excel.")
+        paths = list(meta.get("paths") or [])
+        if paths:
+            ws.range((row, hard_col_1)).value = "\n".join(paths)
 
-        # Exception types
         raw_types = set(meta.get("exception_types") or [])
         filtered = [t for t in sorted(raw_types) if "exception" in t.casefold()]
         if filtered:
             unknown = [t for t in filtered if t not in _ALLOWED_EXC]
-            msg = (f"Found unknown exception types: {', '.join(unknown)}"
-                   if unknown else ", ".join(filtered))
-            ws.range((row, exc_col_1)).value = msg
-        # Print what we found for BO exceptions (even if empty)
-        print(f"[BO] {nm}: exception types -> {sorted(raw_types) if raw_types else 'none'}")
-
+            ws.range((row, exc_col_1)).value = (
+                f"Found unknown exception types: {', '.join(unknown)}" if unknown
+                else ", ".join(filtered)
+            )
 
 # ============================ main flow ============================
 
 _ILLEGAL_SHEET_CHARS = r'[:\\/?*\[\]]'
-
 def _sanitize_sheet_name(name: str) -> str:
     name = re.sub(_ILLEGAL_SHEET_CHARS, "_", name).strip()
     return (name[:31] or "Sheet")
@@ -1278,8 +1078,7 @@ def _sanitize_sheet_name(name: str) -> str:
 def _unique_sheet_name(wb, base: str) -> str:
     base = _sanitize_sheet_name(base)
     taken = [s.name for s in wb.sheets]
-    name = base
-    counter = 2
+    name = base; counter = 2
     while name in taken:
         suffix = f" ({counter})"
         keep = 31 - len(suffix)
@@ -1292,14 +1091,12 @@ def _sheet_by_name_or_index(wb, sheet_arg):
         return wb.sheets[int(sheet_arg)]
     return wb.sheets[str(sheet_arg)]
 
-
 def _all_processes_published(proc_meta: Dict[str, Dict[str, Any]]) -> bool:
     found_any = False
     failing = []
     for name, info in (proc_meta or {}).items():
         pub = info.get("published")
-        if pub is None:
-            continue
+        if pub is None: continue
         found_any = True
         if str(pub).strip().casefold() != "true":
             failing.append((name or "(unnamed)", pub))
@@ -1313,7 +1110,6 @@ def _all_processes_published(proc_meta: Dict[str, Dict[str, Any]]) -> bool:
         return False
     return True
 
-
 def _insert_section_columns_if_needed(ws, plan: Dict[str, Any]) -> None:
     """Insert per-section extra columns exactly once."""
     if plan["type"] == "process" and "published_col" not in plan:
@@ -1323,20 +1119,14 @@ def _insert_section_columns_if_needed(ws, plan: Dict[str, Any]) -> None:
         _insert_bo_extra_columns(ws, plan)
         _write_bo_extra_headers(ws, plan)
 
-
-def validate_and_write_dynamic(
-    excel_path: str,
-    sheet_arg,
-    xml_proc: List[str],
-    xml_bo: List[str],
-    xml_wq: Dict[str, Dict[str, Optional[str]]],
-    xml_env_prod: List[str],
-    xml_local_data_names: List[str],
-    proc_meta: Optional[Dict[str, Dict[str, Any]]] = None,
-    all_procs_published_bool: Optional[bool] = None,
-    obj_meta: Optional[Dict[str, Dict[str, Any]]] = None,
-    common_objects: Optional[Set[str]] = None,
-) -> None:
+def validate_and_write_dynamic(excel_path: str, sheet_arg,
+                               xml_proc: List[str], xml_bo: List[str],
+                               xml_wq: Dict[str, Dict[str, Optional[str]]],
+                               xml_env_prod: List[str], xml_local_data_names: List[str],
+                               proc_meta: Optional[Dict[str, Dict[str, Any]]] = None,
+                               all_procs_published_bool: Optional[bool] = None,
+                               obj_meta: Optional[Dict[str, Dict[str, Any]]] = None,
+                               common_objects: Optional[Set[str]] = None) -> None:
     sheet_arg_pd = int(sheet_arg) if (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()) else sheet_arg
     df = pd.read_excel(excel_path, sheet_name=sheet_arg_pd, header=None, dtype=str, engine="openpyxl").fillna("")
 
@@ -1374,9 +1164,7 @@ def validate_and_write_dynamic(
             plan = build_plan_process_like(
                 df, header_row, columns["name_col"], columns["no_col"], columns["check_col"],
                 columns["validation_col"],
-                xml_proc if marker_type == "process"
-                else xml_bo if marker_type == "business_object"
-                else xml_env_prod,
+                xml_proc if marker_type == "process" else xml_bo if marker_type == "business_object" else xml_env_prod,
                 next_marker_row=next_marker_row
             )
         elif marker_type == "bp_scripts_check":
@@ -1403,10 +1191,8 @@ def validate_and_write_dynamic(
             wb = app.books.open(str(excel_path))
             src_sheet = _sheet_by_name_or_index(wb, sheet_arg)
 
-            try:
-                app.api.EnableEvents = False
-            except Exception:
-                pass
+            try: app.api.EnableEvents = False
+            except Exception: pass
 
             before_names = [s.name for s in wb.sheets]
             src_sheet.api.Copy(After=src_sheet.api)
@@ -1415,10 +1201,8 @@ def validate_and_write_dynamic(
             ws = wb.sheets[added[0]] if len(added) == 1 else wb.sheets[-1]
 
             new_name = _unique_sheet_name(wb, f"{src_sheet.name}_validated")
-            try:
-                ws.name = new_name
-            except Exception as e:
-                print(f"⚠️ Rename failed ({e}); keeping '{ws.name}'")
+            try: ws.name = new_name
+            except Exception as e: print(f"⚠️ Rename failed ({e}); keeping '{ws.name}'")
 
             plans.sort(key=lambda p: p["header_row"])
 
@@ -1426,7 +1210,7 @@ def validate_and_write_dynamic(
             bp_plans = []
 
             for plan in plans:
-                # Adjust absolute positions if rows were inserted above earlier sections
+                # account for inserted rows above earlier sections
                 for key_name in ("start_row_excel", "insert_at_excel_row", "header_excel_row"):
                     if key_name in plan and isinstance(plan[key_name], int):
                         plan[key_name] += total_inserted_above
@@ -1434,24 +1218,20 @@ def validate_and_write_dynamic(
                 # Insert per-section extra columns ONCE
                 _insert_section_columns_if_needed(ws, plan)
 
-                # Write "Validation" header text
+                # Write "Validation" header text (do NOT clear fill here; keep existing)
                 validation_col_1based = plan["validation_col"] + 1
                 ws.range((plan["header_excel_row"], validation_col_1based)).value = "Validation"
 
-                # Existing rows' validation (skip for BP Scripts Check)
+                # Existing rows' validation
                 if plan["type"] != "bp_scripts_check":
                     write_existing_validation(ws, plan["start_row_excel"], plan["validation_col"], plan["validation_vals"])
 
                 rows_added_here = 0
                 if plan["type"] in ("process", "business_object", "environment_variable_prod"):
-                    # Unmerge vertical merges for Name/Validation columns before filling
                     _unmerge_verticals_in_section(
-                        ws,
-                        plan["start_row_excel"],
-                        plan["start_row_excel"] + plan["row_count"] - 1,
+                        ws, plan["start_row_excel"], plan["start_row_excel"] + plan["row_count"] - 1,
                         [plan["name_col"] + 1, plan["validation_col"] + 1]
                     )
-
                     consumed_count = fill_into_blanks_name_table(ws, plan, plan["missing"])
                     remaining_names = plan["missing"][consumed_count:]
                     rows_added_here = insert_new_rows_name_table(ws, plan, remaining_names)
@@ -1478,13 +1258,12 @@ def validate_and_write_dynamic(
 
                 total_inserted_above += rows_added_here
 
-                # Alignment/wrapping: follow header alignment; no background fill propagation
+                # Alignment/wrapping, no background fill propagation
                 hdr_map = _header_index_map(ws, plan["header_excel_row"])
                 to_wrap = []
                 for label in ("published status","hard coded values","exception types","common object","validation"):
                     idx = hdr_map.get(label)
-                    if idx:
-                        to_wrap.append(idx)
+                    if idx: to_wrap.append(idx)
                 if to_wrap:
                     section_start = plan["start_row_excel"]
                     section_rows  = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
@@ -1499,17 +1278,13 @@ def validate_and_write_dynamic(
             wb.save()
             print(f"✅ Completed. Wrote '{ws.name}'.")
     finally:
+        try: app.api.EnableEvents = True
+        except Exception: pass
         try:
-            app.api.EnableEvents = True
-        except Exception:
-            pass
-        try:
-            if wb is not None:
-                wb.close()
+            if wb is not None: wb.close()
         except Exception:
             pass
         app.quit()
-
 
 # ========================= metadata aggregation =========================
 
@@ -1534,30 +1309,23 @@ def get_all_metadata_once(xml_path: str):
                     proc_names.append(name)
                 exc_types: Set[str] = set()
                 path_hits: List[str] = []
-                # owner-scoped walk
                 for sub in _iter_owner_nodes(elem):
                     if _local(sub.tag).casefold() == "exception":
                         t = sub.attrib.get("type")
-                        if t:
-                            exc_types.add(t.strip())
+                        if t: exc_types.add(t.strip())
                     if sub.text:
                         path_hits += _find_paths_in_text(sub.text)
                     for _, av in sub.attrib.items():
                         if av:
                             path_hits += _find_paths_in_text(av)
-                # unique, ordered
                 uniq_paths = list(dict.fromkeys(path_hits))
-                prev = proc_meta.get(name, {"published": None, "exception_types": set(), "paths": []})
                 published = _read_published_value(elem)
+                prev = proc_meta.get(name, {"published": None, "exception_types": set(), "paths": []})
                 keep_pub = prev["published"] if prev["published"] is not None else published
                 merged_exc = prev["exception_types"] | exc_types
                 merged_paths = list(dict.fromkeys(prev["paths"] + uniq_paths))
-                proc_meta[name] = {
-                    "published": keep_pub,
-                    "exception_types": merged_exc,
-                    "paths": merged_paths,
-                }
-                print(f"[PROC] {name}: found {len(uniq_paths)} path(s), published={keep_pub}, exceptions={sorted(merged_exc) if merged_exc else 'none'}")
+                proc_meta[name] = {"published": keep_pub, "exception_types": merged_exc, "paths": merged_paths}
+                print(f"[process] {name}: paths={len(uniq_paths)} (merged={len(merged_paths)}), exceptions={sorted(exc_types) if exc_types else '—'}")
 
         elif tag == "object":
             name = (elem.attrib.get("name") or elem.attrib.get("Name") or "").strip()
@@ -1569,8 +1337,7 @@ def get_all_metadata_once(xml_path: str):
                 for sub in _iter_owner_nodes(elem):
                     if _local(sub.tag).casefold() == "exception":
                         t = sub.attrib.get("type")
-                        if t:
-                            exc_types.add(t.strip())
+                        if t: exc_types.add(t.strip())
                     if sub.text:
                         path_hits += _find_paths_in_text(sub.text)
                     for _, av in sub.attrib.items():
@@ -1580,11 +1347,8 @@ def get_all_metadata_once(xml_path: str):
                 prev = obj_meta.get(name, {"exception_types": set(), "paths": []})
                 merged_exc = prev["exception_types"] | exc_types
                 merged_paths = list(dict.fromkeys(prev["paths"] + uniq_paths))
-                obj_meta[name] = {
-                    "exception_types": merged_exc,
-                    "paths": merged_paths,
-                }
-                print(f"[BO] {name}: found {len(uniq_paths)} path(s), exception types={sorted(merged_exc) if merged_exc else 'none'}")
+                obj_meta[name] = {"exception_types": merged_exc, "paths": merged_paths}
+                print(f"[object ] {name}: paths={len(uniq_paths)} (merged={len(merged_paths)}), exceptions={sorted(exc_types) if exc_types else '—'}")
 
         elif tag == "stage":
             if (elem.attrib.get("type") or "").strip().lower() == "data":
@@ -1596,72 +1360,51 @@ def get_all_metadata_once(xml_path: str):
                         break
                 if nm:
                     if exposure == "environment":
-                        if nm not in env_prod:
-                            env_prod.append(nm)
+                        if nm not in env_prod: env_prod.append(nm)
                     else:
-                        if nm not in local_data_names:
-                            local_data_names.append(nm)
+                        if nm not in local_data_names: local_data_names.append(nm)
 
     return proc_meta, proc_names, obj_names, env_prod, local_data_names, obj_meta
-
 
 # =========================== work queue extractor ===========================
 
 def extract_work_queues_from_xml(xml_path: str) -> Dict[str, Dict[str, Optional[str]]]:
-    """
-    Heuristic extractor:
-      - Looks for tags named 'workqueue', 'work-queue', 'queue' with name attributes,
-        and for child <key> / <keyname> or @key attributes.
-      - Returns {name: {"key": key_or_None}}
-    Harmless if nothing is found.
-    """
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+    tree = ET.parse(xml_path); root = tree.getroot()
     out: Dict[str, Dict[str, Optional[str]]] = {}
-
     candidate_tags = {"workqueue", "work-queue", "queue"}
     for elem in root.iter():
         loc = _local(elem.tag).lower()
         if loc in candidate_tags:
             nm = (elem.attrib.get("name") or elem.attrib.get("Name") or "").strip()
-            if not nm:
-                continue
+            if not nm: continue
             key = elem.attrib.get("key") or elem.attrib.get("Key")
             if not key:
                 for ch in elem:
                     t = _local(ch.tag).lower()
                     if t in {"key", "keyname"}:
                         key = (ch.text or "").strip()
-                        if key:
-                            break
+                        if key: break
             out[nm] = {"key": key or None}
-
     return out
-
 
 # =============================== CLI ===============================
 
 def load_common_objects(path: Optional[str]) -> Set[str]:
-    if not path:
-        return set()
+    if not path: return set()
     out: Set[str] = set()
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             name = line.rstrip("\r\n").strip()
-            if name:
-                out.add(name)
+            if name: out.add(name)
     return out
-
 
 @contextmanager
 def excel_perf_mode(app):
     api = app.api
     prev = {}
     for prop in ("ScreenUpdating", "DisplayAlerts", "EnableEvents", "Calculation"):
-        try:
-            prev[prop] = getattr(api, prop)
-        except Exception:
-            prev[prop] = None
+        try: prev[prop] = getattr(api, prop)
+        except Exception: prev[prop] = None
     try:
         try: api.ScreenUpdating = False
         except Exception: pass
@@ -1681,7 +1424,6 @@ def excel_perf_mode(app):
         except Exception:
             pass
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="Validate sections (Process/Business Object/Work Queue/Environment Variables (PROD)/BP Scripts Check) against a Blue Prism release XML."
@@ -1690,7 +1432,7 @@ def main():
     parser.add_argument("--excel", required=True, help="Path to Excel file (.xlsx/.xlsm)")
     parser.add_argument("--sheet", default="0", help="Sheet name or 0-based index (default: 0)")
     parser.add_argument("--common-objects", default=None,
-                        help="Path to a .txt file of common object names (one per line; trailing spaces ignored)")
+                        help="Path to a .txt file of common object names (one per line; case-sensitive)")
     parser.add_argument("--hardcoded-csv", default=None, help="Optional path to write a CSV report of detected hardcoded literals")
     args = parser.parse_args()
 
@@ -1721,19 +1463,12 @@ def main():
 
     print("🧪 Validating & writing…")
     validate_and_write_dynamic(
-        excel_path=args.excel,
-        sheet_arg=args.sheet,
-        xml_proc=xml_proc,
-        xml_bo=xml_bo,
-        xml_wq=xml_wq,
-        xml_env_prod=xml_env_prod,
-        xml_local_data_names=xml_local_data_names,
+        excel_path=args.excel, sheet_arg=args.sheet,
+        xml_proc=xml_proc, xml_bo=xml_bo, xml_wq=xml_wq,
+        xml_env_prod=xml_env_prod, xml_local_data_names=xml_local_data_names,
         all_procs_published_bool=all_published,
-        proc_meta=proc_meta,
-        obj_meta=obj_meta,
-        common_objects=common_objects,
+        proc_meta=proc_meta, obj_meta=obj_meta, common_objects=common_objects,
     )
-
 
 if __name__ == "__main__":
     main()
