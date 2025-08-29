@@ -108,14 +108,19 @@ def _read_published_value(proc_elem: ET.Element) -> Optional[str]:
 def get_process_metadata(xml_path: str) -> Dict[str, Dict[str, Any]]:
     """
     Returns:
-      { "<process name>": {"published": "True"/"False"/<literal>/None, "exception_types": set([...])}, ...}
+      { "<process name>": {
+           "published": "True"/"False"/<literal>/None,
+           "exception_types": set([...]),
+           "has_path_literal": bool,
+           "path_samples": [up to 3 samples],
+         }, ...}
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()
     meta: Dict[str, Dict[str, Any]] = {}
 
     for proc in root.iter():
-        if _local(proc.tag).casefold() != "process":   # <- case-insensitive
+        if _local(proc.tag).casefold() != "process":
             continue
         name = (proc.attrib.get("name") or proc.attrib.get("Name") or "").strip()
         if not name:
@@ -123,28 +128,49 @@ def get_process_metadata(xml_path: str) -> Dict[str, Dict[str, Any]]:
 
         published = _read_published_value(proc)
 
-        types: Set[str] = set()
+        exc_types: Set[str] = set()
+        path_hits: List[str] = []
+
+        # Walk this process subtree once; collect exceptions + path-like literals
         for elem in proc.iter():
-            if _local(elem.tag).casefold() == "exception":   # <- case-insensitive
+            # exception types
+            if _local(elem.tag).casefold() == "exception":
                 t = elem.attrib.get("type")
                 if t:
-                    types.add(t.strip())
+                    exc_types.add(t.strip())
 
-        # Merge with existing entry without losing a real published value
+            # path-like literals in text
+            if elem.text:
+                path_hits += _find_paths_in_text(elem.text)
+
+            # path-like literals in attributes
+            for _, av in elem.attrib.items():
+                if av:
+                    path_hits += _find_paths_in_text(av)
+
+        # merge with existing without clobbering a real published value
         if name in meta:
             prev = meta[name]
             keep_pub = prev.get("published")
             if keep_pub is None and published is not None:
-                keep_pub = published  # only upgrade None -> real value
+                keep_pub = published
+            combined_exc = (prev.get("exception_types") or set()) | exc_types
+            combined_paths = (prev.get("path_samples") or []) + [p for p in path_hits if p not in (prev.get("path_samples") or [])]
             meta[name] = {
                 "published": keep_pub,
-                "exception_types": (prev.get("exception_types") or set()) | types,
+                "exception_types": combined_exc,
+                "has_path_literal": bool(combined_paths),
+                "path_samples": combined_paths[:3],
             }
         else:
-            meta[name] = {"published": published, "exception_types": types}
+            meta[name] = {
+                "published": published,
+                "exception_types": exc_types,
+                "has_path_literal": bool(path_hits),
+                "path_samples": list(dict.fromkeys(path_hits))[:3],  # de-dupe, keep order
+            }
 
     return meta
-
 
 @contextmanager
 def excel_perf_mode(app):
@@ -174,6 +200,32 @@ def excel_perf_mode(app):
         except Exception:
             pass
 
+# ---- File path detection (Windows absolute + UNC) ----
+
+_PATH_DRIVE_OR_FWD = re.compile(r"""
+    [A-Za-z]:[\\/]
+    [^\s"<>|]*                                  # allow spaces inside, but not leading/trailing
+""", re.VERBOSE)
+
+_PATH_UNC = re.compile(r"""
+    \\\\[A-Za-z0-9._$-]+\\[^\s"<>|]+
+""", re.VERBOSE)
+
+def _find_paths_in_text(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    t = _to_space(s)  # normalise NBSP/newlines
+    if not t or re.fullmatch(r"\[[^\]]+\]", t):  # ignore pure [Placeholders]
+        return []
+    hits = []
+    hits += [m.group(0) for m in _PATH_DRIVE_OR_FWD.finditer(t)]
+    hits += [m.group(0) for m in _PATH_UNC.finditer(t)]
+    # de-dupe while preserving order
+    seen, out = set(), []
+    for h in hits:
+        if h not in seen:
+            seen.add(h); out.append(h)
+    return out
 
 # ---------- Environment variables via exposure / block ----------
 
@@ -1188,10 +1240,10 @@ def _write_process_extra_headers(ws, plan: Dict[str, Any]) -> None:
             ws.api.Cells(row, col1).WrapText = True
         except Exception:
             pass
-
+        
 def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str, Any]]) -> None:
-    # Build a casefold lookup for fallback
-    meta_ci = { (k or "").casefold(): v for k, v in (proc_meta or {}).items() }
+    # Case-sensitive name matching; only whitespace normalised
+    meta_ws = { _to_space(k).strip(): v for k, v in (proc_meta or {}).items() }
 
     name_col_1 = plan["name_col"] + 1
     pub_col_1  = plan["published_col"] + 1
@@ -1200,7 +1252,6 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
 
     total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
 
-    # Before writing, unmerge any vertical merges in the process section across all relevant columns
     cols_to_unmerge = [name_col_1, pub_col_1, hard_col_1, exc_col_1, plan["validation_col"] + 1]
     if plan.get("no_col") is not None:    cols_to_unmerge.append(plan["no_col"] + 1)
     if plan.get("check_col") is not None: cols_to_unmerge.append(plan["check_col"] + 1)
@@ -1210,6 +1261,7 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
         row = plan["start_row_excel"] + offset
         nm = _to_space(ws.range((row, name_col_1)).value).strip()
 
+        # clear cells every pass
         for col1 in (pub_col_1, hard_col_1, exc_col_1):
             paste_formats_like_left(ws, row, col1)
             ws.range((row, col1)).value = ""
@@ -1218,19 +1270,22 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
         if not nm:
             continue
 
-        meta = proc_meta.get(nm)
+        # STRICT (case-sensitive) match; only whitespace is normalised
+        meta = proc_meta.get(nm) or meta_ws.get(nm)
         if meta is None:
-            meta = meta_ci.get(nm.casefold())
+            continue
 
-        # Published status (write literal string if present)
-        pub = (meta or {}).get("published")
+        # Published status
+        pub = meta.get("published")
         if pub is not None:
             ws.range((row, pub_col_1)).value = pub
 
-        # Hard coded values: (placeholder) left empty
+        # Hard coded values: mark if any path-like literals exist in this process
+        if meta.get("has_path_literal"):
+            ws.range((row, hard_col_1)).value = "Yes"  # existence-only (per your requirement)
 
-        # Exception types
-        raw_types = set((meta or {}).get("exception_types") or [])
+        # Exception types (only values containing "Exception")
+        raw_types = set(meta.get("exception_types") or [])
         filtered = [t for t in sorted(raw_types) if "exception" in t.casefold()]
         if filtered:
             unknown = [t for t in filtered if t not in _ALLOWED_EXC]
@@ -1238,7 +1293,6 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
                 ws.range((row, exc_col_1)).value = f"Found unknown exception types: {', '.join(unknown)}"
             else:
                 ws.range((row, exc_col_1)).value = ", ".join(filtered)
-
 
 # ============================ placement helpers ============================
 
@@ -1554,6 +1608,71 @@ def validate_and_write_dynamic(
             pass
         app.quit()
 
+def get_all_metadata_once(xml_path: str):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    proc_meta = {}
+    proc_names: List[str] = []
+    obj_names: List[str] = []
+    env_prod: List[str] = []
+    local_data_names: List[str] = []
+
+    for elem in root.iter():
+        tag = _local(elem.tag).casefold()
+
+        if tag == "process":
+            name = (elem.attrib.get("name") or elem.attrib.get("Name") or "").strip()
+            if name:
+                if name not in proc_names:
+                    proc_names.append(name)
+                # reuse logic from get_process_metadata but without re-parsing
+                published = _read_published_value(elem)
+                exc_types: Set[str] = set()
+                path_hits: List[str] = []
+                for sub in elem.iter():
+                    if _local(sub.tag).casefold() == "exception":
+                        t = sub.attrib.get("type")
+                        if t:
+                            exc_types.add(t.strip())
+                    if sub.text:
+                        path_hits += _find_paths_in_text(sub.text)
+                    for _, av in sub.attrib.items():
+                        if av:
+                            path_hits += _find_paths_in_text(av)
+                prev = proc_meta.get(name, {"published": None, "exception_types": set(), "path_samples": []})
+                keep_pub = prev["published"] if prev["published"] is not None else published
+                merged_exc = prev["exception_types"] | exc_types
+                merged_paths = prev["path_samples"] + [p for p in path_hits if p not in prev["path_samples"]]
+                proc_meta[name] = {
+                    "published": keep_pub,
+                    "exception_types": merged_exc,
+                    "has_path_literal": bool(merged_paths),
+                    "path_samples": merged_paths[:3],
+                }
+
+        elif tag == "object":
+            name = (elem.attrib.get("name") or elem.attrib.get("Name") or "").strip()
+            if name and name not in obj_names:
+                obj_names.append(name)
+
+        elif tag == "stage":
+            if (elem.attrib.get("type") or "").strip().lower() == "data":
+                nm = (elem.attrib.get("name") or elem.attrib.get("Name") or "").strip()
+                exposure = None
+                for ch in elem:
+                    if _local(ch.tag) == "exposure":
+                        exposure = (ch.text or "").strip().lower()
+                        break
+                if nm:
+                    if exposure == "environment":
+                        if nm not in env_prod:
+                            env_prod.append(nm)
+                    else:
+                        if nm not in local_data_names:
+                            local_data_names.append(nm)
+
+    return proc_meta, proc_names, obj_names, env_prod, local_data_names
 
 # =============================== CLI ===============================
 
@@ -1568,8 +1687,8 @@ def main():
     args = parser.parse_args()
 
     print("🔍 Parsing XML…")
-    xml_proc = extract_names_from_xml(args.xml, "process")
-    xml_bo = extract_names_from_xml(args.xml, "object")
+    proc_meta, xml_proc, xml_bo, xml_env_prod, xml_local_data_names = get_all_metadata_once(args.xml)
+
     xml_wq = {}
     try:
         from __main__ import extract_work_queues_from_xml as _maybe_wq
@@ -1577,10 +1696,6 @@ def main():
     except Exception:
         xml_wq = {}
 
-    xml_env_prod = extract_env_variables_from_xml(args.xml)
-    xml_local_data_names = extract_local_data_item_names(args.xml)
-
-    proc_meta = get_process_metadata(args.xml)
     all_published = _all_processes_published(proc_meta)
 
     print(f"✅ XML: processes={len(xml_proc)}, business_objects={len(xml_bo)}, "
