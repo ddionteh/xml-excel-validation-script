@@ -255,6 +255,7 @@ COLOR_RED   = (255, 199, 206)
 COLOR_ORANGE= (255, 235, 156)
 
 def _clone_borders(from_cell_api, to_cell_api) -> None:
+    # copy borders only; leave alignment for header-driven step later
     for border_id in (7, 8, 9, 10, 11, 12):
         try:
             bsrc = from_cell_api.Borders(border_id)
@@ -264,28 +265,25 @@ def _clone_borders(from_cell_api, to_cell_api) -> None:
             bdst.Color = bsrc.Color
         except Exception:
             pass
-    try:
-        to_cell_api.HorizontalAlignment = from_cell_api.HorizontalAlignment
-        to_cell_api.VerticalAlignment = from_cell_api.VerticalAlignment
-    except Exception:
-        pass
+
 
 def _apply_borders_like_left(ws, row_1based: int, col_1based: int) -> None:
     if col_1based <= 1: return
     try:
         left = ws.api.Cells(row_1based, col_1based - 1)
         dst = ws.api.Cells(row_1based, col_1based)
-        _clone_borders(left, dst)
+        _clone_borders(left, dst)  # borders only
     except Exception:
         pass
 
 def clear_fill_preserve_borders(ws, row_1based: int, col_1based: int) -> None:
-    """Clear fill; preserve borders/alignment by cloning from LEFT neighbor (same row)."""
     try:
         dst = ws.api.Cells(row_1based, col_1based)
+        # clear background only
         dst.Interior.Pattern = -4142  # xlPatternNone
         dst.Interior.TintAndShade = 0
         dst.Interior.PatternTintAndShade = 0
+        # keep borders consistent with left neighbor
         if col_1based > 1:
             left = ws.api.Cells(row_1based, col_1based - 1)
             _clone_borders(left, dst)
@@ -673,17 +671,21 @@ def write_existing_validation(ws, start_row_excel: int, validation_col0: int, st
     validation_col_1based = validation_col0 + 1
     for offset, status in enumerate(statuses):
         row_1based = start_row_excel + offset
-        _apply_borders_like_left(ws, row_1based, validation_col_1based)  # borders only
+
+        _apply_borders_like_left(ws, row_1based, validation_col_1based)
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
+
         cell = ws.range((row_1based, validation_col_1based))
         cell.value = status if status else ""
+
         if status == "Exists":
             cell.color = COLOR_GREEN
         elif status == "Does not exist":
             cell.color = COLOR_RED
+        elif status and status.lower().startswith(("newly added", "exists (key mismatch", "newly added (key mismatch", "also defined locally")):
+            cell.color = COLOR_ORANGE
         else:
             cell.color = None
-        # ensure clean background stylings
-        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
 def fill_into_blanks_name_table(ws, plan: Dict[str, Any], names_to_place: List[str]) -> int:
     consumed = 0
@@ -701,9 +703,9 @@ def fill_into_blanks_name_table(ws, plan: Dict[str, Any], names_to_place: List[s
         ws.range((row_1based, name_col_1based)).value = new_name
 
         _apply_borders_like_left(ws, row_1based, validation_col_1based)
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
         ws.range((row_1based, validation_col_1based)).value = "Newly added"
         ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
-        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
         if no_col_1based is not None:
             current_text = str(ws.range((row_1based, no_col_1based)).value or "")
@@ -737,9 +739,9 @@ def insert_new_rows_name_table(ws, plan: Dict[str, Any], remaining: List[str]) -
         ws.range((row_1based, name_col_1based)).value = new_name
 
         _apply_borders_like_left(ws, row_1based, validation_col_1based)
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
         ws.range((row_1based, validation_col_1based)).value = "Newly added"
         ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
-        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
         if no_col_1based is not None and next_no is not None:
             ws.range((row_1based, no_col_1based)).value = next_no
@@ -773,9 +775,9 @@ def fill_into_blanks_wq(ws, plan: Dict[str, Any], names_to_place: List[str], xml
                 ws.range((row_1based, key_col_1based)).value = key_val
 
         _apply_borders_like_left(ws, row_1based, validation_col_1based)
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
         ws.range((row_1based, validation_col_1based)).value = "Newly added"
         ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
-        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
         if no_col_1based is not None:
             current_text = str(ws.range((row_1based, no_col_1based)).value or "")
@@ -793,6 +795,7 @@ def fill_into_blanks_wq(ws, plan: Dict[str, Any], names_to_place: List[str], xml
 
     plan["next_no"] = next_no
     return consumed
+
 
 def insert_new_rows_wq(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: Dict[str, Dict[str, Optional[str]]]) -> int:
     if not remaining: return 0
@@ -814,9 +817,9 @@ def insert_new_rows_wq(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: D
                 ws.range((row_1based, key_col_1based)).value = key_val
 
         _apply_borders_like_left(ws, row_1based, validation_col_1based)
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
         ws.range((row_1based, validation_col_1based)).value = "Newly added"
         ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
-        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
         if no_col_1based is not None and next_no is not None:
             ws.range((row_1based, no_col_1based)).value = next_no
@@ -886,36 +889,53 @@ def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], all_processes_pu
     if plan.get("target_row_rel") is None: return
     row_1based = plan["start_row_excel"] + plan["target_row_rel"]
     validation_col_1based = plan["validation_col"] + 1
+
     _apply_borders_like_left(ws, row_1based, validation_col_1based)
+    clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
+
     if all_processes_published:
         ws.range((row_1based, validation_col_1based)).value = "Yes"
         ws.range((row_1based, validation_col_1based)).color = COLOR_GREEN
     else:
         ws.range((row_1based, validation_col_1based)).value = "No"
         ws.range((row_1based, validation_col_1based)).color = COLOR_RED
-    clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
 # ---------- Process & BO extras: in-place (no column insertion) ----------
 
 _ALLOWED_EXC = {"System Exception", "Business Exception"}
 
 def _prepare_new_header_cell(ws, row_1based: int, col_1based: int) -> None:
-    """For a header cell we are about to write: unmerge horizontal single-row,
-    then copy fill/alignment/borders from the header cell to the left."""
     _unmerge_if_single_row_merge(ws, row_1based, col_1based)
     try:
         if col_1based > 1:
             left = ws.api.Cells(row_1based, col_1based - 1)
             dst  = ws.api.Cells(row_1based, col_1based)
-            # copy fill & alignment from the left header
-            dst.Interior.Pattern = left.Interior.Pattern
-            dst.Interior.Color = left.Interior.Color
-            dst.Interior.TintAndShade = left.Interior.TintAndShade
-            dst.HorizontalAlignment = left.HorizontalAlignment
-            dst.VerticalAlignment   = left.VerticalAlignment
+
+            # background
+            dst.Interior.Pattern       = left.Interior.Pattern
+            dst.Interior.Color         = left.Interior.Color
+            dst.Interior.TintAndShade  = left.Interior.TintAndShade
+
+            # font (bolding etc.)
+            dst.Font.Bold   = left.Font.Bold
+            dst.Font.Name   = left.Font.Name
+            dst.Font.Size   = left.Font.Size
+            try:
+                dst.Font.Color = left.Font.Color
+            except Exception:
+                pass
+
+            # wrap/orientation
+            try: dst.WrapText    = left.WrapText
+            except Exception: pass
+            try: dst.Orientation = left.Orientation
+            except Exception: pass
+
+            # borders
             _clone_borders(left, dst)
     except Exception:
         pass
+
 
 def _configure_process_headers_in_place(ws, plan: Dict[str, Any]) -> None:
     """Place Process headers in-place: extras to the LEFT of Validation.
