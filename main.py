@@ -200,6 +200,17 @@ def excel_perf_mode(app):
         except Exception:
             pass
 
+def load_common_objects(path: Optional[str]) -> Set[str]:
+    if not path:
+        return set()
+    out: Set[str] = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            name = line.rstrip("\r\n").strip()
+            if name:
+                out.add(name)
+    return out
+
 # ---- File path detection (Windows absolute + UNC) ----
 
 _PATH_DRIVE_OR_FWD = re.compile(r"""
@@ -372,6 +383,36 @@ def find_hardcoded_literals(xml_path: str, min_len: int = 3) -> List[Dict[str, s
                 hits.append({"where": _context(elem), "tag_or_attr": f"@{an}", "value": av})
     return hits
 
+def _insert_bo_extra_columns(ws, plan: Dict[str, Any]) -> None:
+    # Insert 3 columns BEFORE Validation and shift plan['validation_col'] right by 3
+    vcol_1 = plan["validation_col"] + 1
+    for _ in range(3):
+        try:
+            ws.api.Columns(vcol_1).Insert(Shift=-4161)  # xlShiftToRight
+        except Exception:
+            ws.api.Cells(1, vcol_1).EntireColumn.Insert(Shift=-4161)
+
+    base0 = plan["validation_col"]
+    plan["bo_common_col"]    = base0
+    plan["bo_hardcoded_col"] = base0 + 1
+    plan["bo_exception_col"] = base0 + 2
+    plan["validation_col"]   = base0 + 3
+
+def _write_bo_extra_headers(ws, plan: Dict[str, Any]) -> None:
+    row = plan["header_excel_row"]
+    labels = [
+        ("Common Object",             plan["bo_common_col"] + 1),
+        ("Hard coded values exist",   plan["bo_hardcoded_col"] + 1),
+        ("Exception Types",           plan["bo_exception_col"] + 1),
+    ]
+    for text, col1 in labels:
+        paste_formats_like_left(ws, row, col1)
+        ws.range((row, col1)).value = text
+        _apply_borders_like_left(ws, row, col1)
+        try:
+            ws.api.Cells(row, col1).WrapText = True
+        except Exception:
+            pass
 
 # ==================== normalization / tokens ====================
 
@@ -627,6 +668,61 @@ def pick_columns(df: pd.DataFrame, header_row: int, section_type: str) -> Dict[s
 
 
 # ======================= planning per section =======================
+
+def write_bo_extras(
+    ws,
+    plan: Dict[str, Any],
+    obj_meta: Dict[str, Dict[str, Any]],
+    common_objects: Set[str],
+) -> None:
+    name_col_1 = plan["name_col"] + 1
+    common_col_1 = plan["bo_common_col"] + 1
+    hard_col_1 = plan["bo_hardcoded_col"] + 1
+    exc_col_1 = plan["bo_exception_col"] + 1
+
+    total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
+
+    cols_to_unmerge = [name_col_1, common_col_1, hard_col_1, exc_col_1, plan["validation_col"] + 1]
+    if plan.get("no_col") is not None:    cols_to_unmerge.append(plan["no_col"] + 1)
+    if plan.get("check_col") is not None: cols_to_unmerge.append(plan["check_col"] + 1)
+    _unmerge_verticals_in_section(ws, plan["start_row_excel"], plan["start_row_excel"] + total_rows - 1, cols_to_unmerge)
+
+    # case-sensitive mapping (whitespace normalised)
+    meta_ws = { _to_space(k).strip(): v for k, v in (obj_meta or {}).items() }
+
+    for offset in range(total_rows):
+        row = plan["start_row_excel"] + offset
+        nm = _to_space(ws.range((row, name_col_1)).value).strip()
+
+        for col1 in (common_col_1, hard_col_1, exc_col_1):
+            paste_formats_like_left(ws, row, col1)
+            ws.range((row, col1)).value = ""
+            _apply_borders_like_left(ws, row, col1)
+
+        if not nm:
+            continue
+
+        # Common Object? (case-sensitive)
+        if common_objects:
+            ws.range((row, common_col_1)).value = "Yes" if nm in common_objects else "No"
+
+        meta = (obj_meta or {}).get(nm) or meta_ws.get(nm)
+        if not meta:
+            continue
+
+        # Hard coded values exist
+        if meta.get("has_path_literal"):
+            ws.range((row, hard_col_1)).value = "Yes"
+
+        # Exception types (only ones containing "Exception")
+        raw_types = set(meta.get("exception_types") or [])
+        filtered = [t for t in sorted(raw_types) if "exception" in t.casefold()]
+        if filtered:
+            unknown = [t for t in filtered if t not in _ALLOWED_EXC]
+            ws.range((row, exc_col_1)).value = (
+                f"Found unknown exception types: {', '.join(unknown)}" if unknown
+                else ", ".join(filtered)
+            )
 
 def _row_has_any_nonblank(series: pd.Series) -> bool:
     return any(_to_space(v).strip() != "" for v in list(series.values))
@@ -1420,6 +1516,8 @@ def validate_and_write_dynamic(
     xml_local_data_names: List[str],
     proc_meta: Optional[Dict[str, Dict[str, Any]]] = None,
     all_procs_published_bool: Optional[bool] = None,
+    obj_meta: Optional[Dict[str, Dict[str, Any]]] = None,
+    common_objects: Optional[Set[str]] = None,
 ) -> None:
     sheet_arg_pd = int(sheet_arg) if (isinstance(sheet_arg, str) and str(sheet_arg).isdigit()) else sheet_arg
     df = pd.read_excel(excel_path, sheet_name=sheet_arg_pd, header=None, dtype=str, engine="openpyxl").fillna("")
@@ -1516,10 +1614,12 @@ def validate_and_write_dynamic(
                     if key_name in plan and isinstance(plan[key_name], int):
                         plan[key_name] += total_inserted_above
 
-                if plan["type"] == "process":
-                    # Insert the 3 cols physically, then add headers
-                    _insert_process_extra_columns(ws, plan)
-                    _write_process_extra_headers(ws, plan)
+                    if plan["type"] == "process":
+                        _insert_process_extra_columns(ws, plan)
+                        _write_process_extra_headers(ws, plan)
+                    elif plan["type"] == "business_object":
+                        _insert_bo_extra_columns(ws, plan)
+                        _write_bo_extra_headers(ws, plan)
 
                 # Write "Validation" header
                 validation_col_1based = plan["validation_col"] + 1
@@ -1556,6 +1656,9 @@ def validate_and_write_dynamic(
 
                     if plan["type"] == "process":
                         write_process_extras(ws, plan, proc_meta or {})
+                    elif plan["type"] == "business_object":
+                        write_bo_extras(ws, plan, obj_meta or {}, common_objects or set())
+
 
                 elif plan["type"] == "bp_scripts_check":
                     bp_plans.append(plan)
@@ -1572,7 +1675,7 @@ def validate_and_write_dynamic(
                 # Header/values wrapping + min width for our new columns (where applicable)
                 hdr_map = _header_index_map(ws, plan["header_excel_row"])
                 to_wrap = []
-                for label in ("published status", "hard coded values", "exception types", "validation"):
+                for label in ("published status","hard coded values","exception types","common object","hard coded values exist","validation",):
                     idx = hdr_map.get(label)
                     if idx:
                         to_wrap.append(idx)
@@ -1613,6 +1716,7 @@ def get_all_metadata_once(xml_path: str):
     root = tree.getroot()
 
     proc_meta = {}
+    obj_meta = {}
     proc_names: List[str] = []
     obj_names: List[str] = []
     env_prod: List[str] = []
@@ -1653,8 +1757,34 @@ def get_all_metadata_once(xml_path: str):
 
         elif tag == "object":
             name = (elem.attrib.get("name") or elem.attrib.get("Name") or "").strip()
-            if name and name not in obj_names:
-                obj_names.append(name)
+            if name:
+                if name not in obj_names:
+                    obj_names.append(name)
+
+                exc_types: Set[str] = set()
+                path_hits: List[str] = []
+
+                for sub in elem.iter():
+                    if _local(sub.tag).casefold() == "exception":
+                        t = sub.attrib.get("type")
+                        if t:
+                            exc_types.add(t.strip())
+                    if sub.text:
+                        path_hits += _find_paths_in_text(sub.text)
+                    for _, av in sub.attrib.items():
+                        if av:
+                            path_hits += _find_paths_in_text(av)
+
+                prev = obj_meta.get(name, {"exception_types": set(), "path_samples": []})
+                merged_exc = prev["exception_types"] | exc_types
+                merged_paths = prev["path_samples"] + [p for p in path_hits if p not in prev["path_samples"]]
+
+                obj_meta[name] = {
+                    "exception_types": merged_exc,
+                    "has_path_literal": bool(merged_paths),
+                    "path_samples": merged_paths[:3],
+                }
+
 
         elif tag == "stage":
             if (elem.attrib.get("type") or "").strip().lower() == "data":
@@ -1672,7 +1802,7 @@ def get_all_metadata_once(xml_path: str):
                         if nm not in local_data_names:
                             local_data_names.append(nm)
 
-    return proc_meta, proc_names, obj_names, env_prod, local_data_names
+    return proc_meta, proc_names, obj_names, env_prod, local_data_names, obj_meta
 
 # =============================== CLI ===============================
 
@@ -1683,11 +1813,13 @@ def main():
     parser.add_argument("--xml", required=True, help="Path to Blue Prism .bprelease XML")
     parser.add_argument("--excel", required=True, help="Path to Excel file (.xlsx/.xlsm)")
     parser.add_argument("--sheet", default="0", help="Sheet name or 0-based index (default: 0)")
+    parser.add_argument("--common-objects", default=None, help="Path to a .txt file of common object names - one per line")
     parser.add_argument("--hardcoded-csv", default=None, help="Optional path to write a CSV report of detected hardcoded literals")
     args = parser.parse_args()
 
     print("🔍 Parsing XML…")
-    proc_meta, xml_proc, xml_bo, xml_env_prod, xml_local_data_names = get_all_metadata_once(args.xml)
+    proc_meta, xml_proc, xml_bo, xml_env_prod, xml_local_data_names, obj_meta = get_all_metadata_once(args.xml)
+    common_objects = load_common_objects(args.common_objects)
 
     xml_wq = {}
     try:
@@ -1723,7 +1855,10 @@ def main():
         xml_local_data_names=xml_local_data_names,
         all_procs_published_bool=all_published,
         proc_meta=proc_meta,
+        obj_meta=obj_meta,
+        common_objects=common_objects,
     )
+
 
 
 if __name__ == "__main__":
