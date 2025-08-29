@@ -4,17 +4,18 @@ Validate Excel sections against a Blue Prism release XML (dynamic sections).
 
 Fixes & behavior
 ----------------
-- Inserts section columns exactly once (no duplicates).
-- Prevents header background "bleed": clears fill on the newly inserted column headers,
-  unmerges single-row merges at those header cells before writing header text.
+- Does NOT insert whole-sheet columns anymore. Extra columns are written in-place
+  to the right within the section only (no sheet-wide formatting impact).
+- Removes vertical unmerge logic entirely.
+- Header background: copies fill/borders/alignment from the left header cell
+  for any newly created header in the section row only.
+- Borders for data writes: clear fill and clone borders/alignment from the LEFT
+  neighbor (same row). New rows inherit formats from the row above when inserted.
 - Hard coded values: writes ALL detected paths/URLs (one per line), not capped.
 - Path detection: greedy drive path regex (C–Z) + UNC + http(s) URLs; no truncation like C:\T.
-- Owner-scoped traversal: for each <process> and <object>, scan only its subtree (without
-  descending into nested owners). So <object><process>…</process></object> => paths belong
-  to the PROCESS, not the object.
-- Common Object (BO): case-insensitive Yes/No using your .txt list.
+- Owner-scoped traversal for processes/objects; BO "Common Object" from .txt (case-sensitive).
 - Console prints: per-process/BO path counts and BO exception types for visibility.
-- Formatting: borders/alignment copied; background fills for data cells are cleared (no bleed).
+- Formatting: alignment copied from headers, columns wrapped, min width enforced.
 """
 
 import argparse
@@ -279,17 +280,20 @@ def _apply_borders_like_left(ws, row_1based: int, col_1based: int) -> None:
         pass
 
 def clear_fill_preserve_borders(ws, row_1based: int, col_1based: int) -> None:
+    """Clear fill; preserve borders/alignment by cloning from LEFT neighbor (same row)."""
     try:
         dst = ws.api.Cells(row_1based, col_1based)
         dst.Interior.Pattern = -4142  # xlPatternNone
         dst.Interior.TintAndShade = 0
         dst.Interior.PatternTintAndShade = 0
-        if row_1based > 1:
-            _clone_borders(ws.api.Cells(row_1based - 1, col_1based), dst)
+        if col_1based > 1:
+            left = ws.api.Cells(row_1based, col_1based - 1)
+            _clone_borders(left, dst)
     except Exception:
         pass
 
 def _unmerge_if_single_row_merge(ws, row_1based: int, col_1based: int) -> None:
+    """Only for header cleanup, if cell is part of a single-row horizontal merge."""
     try:
         cell = ws.api.Cells(row_1based, col_1based)
         if cell.MergeCells:
@@ -422,7 +426,7 @@ def find_header_after_marker(df: pd.DataFrame, marker_row: int, section_type: st
 
 def pick_columns(df: pd.DataFrame, header_row: int, section_type: str) -> Dict[str, Optional[int]]:
     normed = [(_norm(v), idx) for idx, v in df.iloc[header_row].items()]
-    # Validation column
+    # Validation column (if pre-existing)
     validation_col = None
     for text, idx in normed:
         if text == "validation":
@@ -665,26 +669,10 @@ def build_plan_bp_scripts_check(df: pd.DataFrame, header_row: int,
 
 # ========================= writers & utilities =========================
 
-def _unmerge_cell_if_rowspan(ws, row_1based: int, col_1based: int) -> None:
-    try:
-        cell = ws.api.Cells(row_1based, col_1based)
-        if cell.MergeCells:
-            area = cell.MergeArea
-            if int(area.Rows.Count) > 1:
-                area.UnMerge()
-    except Exception:
-        pass
-
-def _unmerge_verticals_in_section(ws, start_row_1based: int, end_row_1based: int, col_1based_list: List[int]) -> None:
-    for r in range(start_row_1based, end_row_1based + 1):
-        for c in col_1based_list:
-            _unmerge_cell_if_rowspan(ws, r, c)
-
 def write_existing_validation(ws, start_row_excel: int, validation_col0: int, statuses: List[str]) -> None:
     validation_col_1based = validation_col0 + 1
     for offset, status in enumerate(statuses):
         row_1based = start_row_excel + offset
-        _unmerge_cell_if_rowspan(ws, row_1based, validation_col_1based)
         _apply_borders_like_left(ws, row_1based, validation_col_1based)  # borders only
         cell = ws.range((row_1based, validation_col_1based))
         cell.value = status if status else ""
@@ -694,6 +682,8 @@ def write_existing_validation(ws, start_row_excel: int, validation_col0: int, st
             cell.color = COLOR_RED
         else:
             cell.color = None
+        # ensure clean background stylings
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
 def fill_into_blanks_name_table(ws, plan: Dict[str, Any], names_to_place: List[str]) -> int:
     consumed = 0
@@ -708,14 +698,12 @@ def fill_into_blanks_name_table(ws, plan: Dict[str, Any], names_to_place: List[s
         row_1based = plan["start_row_excel"] + rel_index
         new_name = names_to_place[consumed]
 
-        for col1 in [name_col_1based, validation_col_1based, no_col_1based or 0, check_col_1based or 0]:
-            if col1: _unmerge_cell_if_rowspan(ws, row_1based, col1)
-
         ws.range((row_1based, name_col_1based)).value = new_name
 
         _apply_borders_like_left(ws, row_1based, validation_col_1based)
         ws.range((row_1based, validation_col_1based)).value = "Newly added"
         ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
         if no_col_1based is not None:
             current_text = str(ws.range((row_1based, no_col_1based)).value or "")
@@ -746,14 +734,12 @@ def insert_new_rows_name_table(ws, plan: Dict[str, Any], remaining: List[str]) -
         row_1based = plan["insert_at_excel_row"] + offset
         insert_row_with_style(ws, row_1based)
 
-        for col1 in [name_col_1based, validation_col_1based, no_col_1based or 0, check_col_1based or 0]:
-            if col1: _unmerge_cell_if_rowspan(ws, row_1based, col1)
-
         ws.range((row_1based, name_col_1based)).value = new_name
 
         _apply_borders_like_left(ws, row_1based, validation_col_1based)
         ws.range((row_1based, validation_col_1based)).value = "Newly added"
         ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
         if no_col_1based is not None and next_no is not None:
             ws.range((row_1based, no_col_1based)).value = next_no
@@ -780,9 +766,6 @@ def fill_into_blanks_wq(ws, plan: Dict[str, Any], names_to_place: List[str], xml
         row_1based = plan["start_row_excel"] + rel_index
         new_name = names_to_place[consumed]
 
-        for col1 in [name_col_1based, validation_col_1based, key_col_1based or 0, no_col_1based or 0, check_col_1based or 0]:
-            if col1: _unmerge_cell_if_rowspan(ws, row_1based, col1)
-
         ws.range((row_1based, name_col_1based)).value = new_name
         if key_col_1based is not None:
             key_val = (xml_wq.get(new_name, {}) or {}).get("key") or ""
@@ -792,6 +775,7 @@ def fill_into_blanks_wq(ws, plan: Dict[str, Any], names_to_place: List[str], xml
         _apply_borders_like_left(ws, row_1based, validation_col_1based)
         ws.range((row_1based, validation_col_1based)).value = "Newly added"
         ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
         if no_col_1based is not None:
             current_text = str(ws.range((row_1based, no_col_1based)).value or "")
@@ -823,9 +807,6 @@ def insert_new_rows_wq(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: D
         row_1based = plan["insert_at_excel_row"] + offset
         insert_row_with_style(ws, row_1based)
 
-        for col1 in [name_col_1based, validation_col_1based, key_col_1based or 0, no_col_1based or 0, check_col_1based or 0]:
-            if col1: _unmerge_cell_if_rowspan(ws, row_1based, col1)
-
         ws.range((row_1based, name_col_1based)).value = new_name
         if key_col_1based is not None:
             key_val = (xml_wq.get(new_name, {}) or {}).get("key") or ""
@@ -835,6 +816,7 @@ def insert_new_rows_wq(ws, plan: Dict[str, Any], remaining: List[str], xml_wq: D
         _apply_borders_like_left(ws, row_1based, validation_col_1based)
         ws.range((row_1based, validation_col_1based)).value = "Newly added"
         ws.range((row_1based, validation_col_1based)).color = COLOR_ORANGE
+        clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
         if no_col_1based is not None and next_no is not None:
             ws.range((row_1based, no_col_1based)).value = next_no
@@ -911,51 +893,112 @@ def write_bp_scripts_check_validation(ws, plan: Dict[str, Any], all_processes_pu
     else:
         ws.range((row_1based, validation_col_1based)).value = "No"
         ws.range((row_1based, validation_col_1based)).color = COLOR_RED
+    clear_fill_preserve_borders(ws, row_1based, validation_col_1based)
 
-# ---------- Process & BO extras (insert columns, write values) ----------
+# ---------- Process & BO extras: in-place (no column insertion) ----------
 
 _ALLOWED_EXC = {"System Exception", "Business Exception"}
 
 def _prepare_new_header_cell(ws, row_1based: int, col_1based: int) -> None:
-    # Unmerge single-row merges and clear fill so header highlight doesn't bleed
+    """For a header cell we are about to write: unmerge horizontal single-row,
+    then copy fill/alignment/borders from the header cell to the left."""
     _unmerge_if_single_row_merge(ws, row_1based, col_1based)
-    clear_fill_preserve_borders(ws, row_1based, col_1based)
+    try:
+        if col_1based > 1:
+            left = ws.api.Cells(row_1based, col_1based - 1)
+            dst  = ws.api.Cells(row_1based, col_1based)
+            # copy fill & alignment from the left header
+            dst.Interior.Pattern = left.Interior.Pattern
+            dst.Interior.Color = left.Interior.Color
+            dst.Interior.TintAndShade = left.Interior.TintAndShade
+            dst.HorizontalAlignment = left.HorizontalAlignment
+            dst.VerticalAlignment   = left.VerticalAlignment
+            _clone_borders(left, dst)
+    except Exception:
+        pass
 
-def _insert_process_extra_columns(ws, plan: Dict[str, Any]) -> None:
-    """Insert 3 columns BEFORE Validation and shift indices. Also clear header fills on the new cells."""
-    vcol_1 = plan["validation_col"] + 1
-    for _ in range(3):
-        try:
-            ws.api.Columns(vcol_1).Insert(Shift=-4161)  # xlShiftToRight
-        except Exception:
-            ws.api.Cells(1, vcol_1).EntireColumn.Insert(Shift=-4161)
+def _configure_process_headers_in_place(ws, plan: Dict[str, Any]) -> None:
+    """Place Process headers in-place: extras to the LEFT of Validation.
+    If Validation already exists, put extras immediately to its left.
+    If not, append [Published, Hard coded, Exception, Validation] to the right of existing section headers.
+    """
+    hdr_map = _header_index_map(ws, plan["header_excel_row"])  # keys are normalized lower-case
 
-    base0 = plan["validation_col"]
+    # If everything already exists, just record their 0-based indices.
+    if all(k in hdr_map for k in ("published status","hard coded values","exception types","validation")):
+        plan["published_col"]  = hdr_map["published status"] - 1
+        plan["hardcoded_col"]  = hdr_map["hard coded values"] - 1
+        plan["exception_col"]  = hdr_map["exception types"] - 1
+        plan["validation_col"] = hdr_map["validation"] - 1
+        return
+
+    row = plan["header_excel_row"]
+
+    if "validation" in hdr_map:
+        # Validation exists — put extras immediately to its LEFT.
+        vcol0 = hdr_map["validation"] - 1  # 0-based
+        plan["validation_col"] = vcol0
+        plan["published_col"]  = vcol0 - 3
+        plan["hardcoded_col"]  = vcol0 - 2
+        plan["exception_col"]  = vcol0 - 1
+
+        # Create the three extras' headers (copy style from the left header cell)
+        for col0, label in (
+            (plan["published_col"], "Published status"),
+            (plan["hardcoded_col"], "Hard coded values"),
+            (plan["exception_col"], "Exception Types"),
+        ):
+            _prepare_new_header_cell(ws, row, col0 + 1)
+            ws.range((row, col0 + 1)).value = label
+        return
+
+    # No Validation yet — append extras then Validation (extras on the LEFT of Validation).
+    base0 = plan["validation_col"]  # this is the first free header slot (computed earlier)
     plan["published_col"]  = base0
     plan["hardcoded_col"]  = base0 + 1
     plan["exception_col"]  = base0 + 2
     plan["validation_col"] = base0 + 3
 
-    # Header-row cleanup (no background bleed)
-    row = plan["header_excel_row"]
-    for col0 in (plan["published_col"], plan["hardcoded_col"], plan["exception_col"]):
+    for col0, label in (
+        (plan["published_col"],  "Published status"),
+        (plan["hardcoded_col"],  "Hard coded values"),
+        (plan["exception_col"],  "Exception Types"),
+        (plan["validation_col"], "Validation"),
+    ):
         _prepare_new_header_cell(ws, row, col0 + 1)
+        ws.range((row, col0 + 1)).value = label
 
-def _write_process_extra_headers(ws, plan: Dict[str, Any]) -> None:
+def _configure_bo_headers_in_place(ws, plan: Dict[str, Any]) -> None:
+    """Place BO headers in-place: extras to the LEFT of Validation.
+    If Validation already exists, put extras immediately to its left.
+    If not, append [Common, Hard coded, Exception, Validation] to the right of existing section headers.
+    """
+    hdr_map = _header_index_map(ws, plan["header_excel_row"])
+
+    if all(k in hdr_map for k in ("common object","hard coded values","exception types","validation")):
+        plan["bo_common_col"]    = hdr_map["common object"] - 1
+        plan["bo_hardcoded_col"] = hdr_map["hard coded values"] - 1
+        plan["bo_exception_col"] = hdr_map["exception types"] - 1
+        plan["validation_col"]   = hdr_map["validation"] - 1
+        return
+
     row = plan["header_excel_row"]
-    labels = [("Published status", plan["published_col"] + 1),
-              ("Hard coded values", plan["hardcoded_col"] + 1),
-              ("Exception Types",   plan["exception_col"] + 1)]
-    for text, col1 in labels:
-        ws.range((row, col1)).value = text
 
-def _insert_bo_extra_columns(ws, plan: Dict[str, Any]) -> None:
-    vcol_1 = plan["validation_col"] + 1
-    for _ in range(3):
-        try:
-            ws.api.Columns(vcol_1).Insert(Shift=-4161)
-        except Exception:
-            ws.api.Cells(1, vcol_1).EntireColumn.Insert(Shift=-4161)
+    if "validation" in hdr_map:
+        vcol0 = hdr_map["validation"] - 1
+        plan["validation_col"]   = vcol0
+        plan["bo_common_col"]    = vcol0 - 3
+        plan["bo_hardcoded_col"] = vcol0 - 2
+        plan["bo_exception_col"] = vcol0 - 1
+
+        for col0, label in (
+            (plan["bo_common_col"],    "Common Object"),
+            (plan["bo_hardcoded_col"], "Hard coded values"),
+            (plan["bo_exception_col"], "Exception Types"),
+        ):
+            _prepare_new_header_cell(ws, row, col0 + 1)
+            ws.range((row, col0 + 1)).value = label
+        return
 
     base0 = plan["validation_col"]
     plan["bo_common_col"]    = base0
@@ -963,17 +1006,14 @@ def _insert_bo_extra_columns(ws, plan: Dict[str, Any]) -> None:
     plan["bo_exception_col"] = base0 + 2
     plan["validation_col"]   = base0 + 3
 
-    row = plan["header_excel_row"]
-    for col0 in (plan["bo_common_col"], plan["bo_hardcoded_col"], plan["bo_exception_col"]):
+    for col0, label in (
+        (plan["bo_common_col"],    "Common Object"),
+        (plan["bo_hardcoded_col"], "Hard coded values"),
+        (plan["bo_exception_col"], "Exception Types"),
+        (plan["validation_col"],   "Validation"),
+    ):
         _prepare_new_header_cell(ws, row, col0 + 1)
-
-def _write_bo_extra_headers(ws, plan: Dict[str, Any]) -> None:
-    row = plan["header_excel_row"]
-    labels = [("Common Object",    plan["bo_common_col"] + 1),
-              ("Hard coded values", plan["bo_hardcoded_col"] + 1),
-              ("Exception Types",  plan["bo_exception_col"] + 1)]
-    for text, col1 in labels:
-        ws.range((row, col1)).value = text
+        ws.range((row, col0 + 1)).value = label
 
 def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str, Any]]) -> None:
     name_col_1 = plan["name_col"] + 1
@@ -982,10 +1022,6 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
     exc_col_1  = plan["exception_col"] + 1
 
     total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
-    cols_to_unmerge = [name_col_1, pub_col_1, hard_col_1, exc_col_1, plan["validation_col"] + 1]
-    if plan.get("no_col") is not None:    cols_to_unmerge.append(plan["no_col"] + 1)
-    if plan.get("check_col") is not None: cols_to_unmerge.append(plan["check_col"] + 1)
-    _unmerge_verticals_in_section(ws, plan["start_row_excel"], plan["start_row_excel"] + total_rows - 1, cols_to_unmerge)
 
     for offset in range(total_rows):
         row = plan["start_row_excel"] + offset
@@ -998,6 +1034,7 @@ def write_process_extras(ws, plan: Dict[str, Any], proc_meta: Dict[str, Dict[str
 
         if not nm:
             continue
+        # meta = proc_meta.get(nm) or next((v for k, v in proc_meta.items() if _to_space(k).strip() == nm), None)
         meta = proc_meta.get(nm) or {k: v for k, v in proc_meta.items() if _to_space(k).strip() == nm}
         if not meta:
             continue
@@ -1026,12 +1063,6 @@ def write_bo_extras(ws, plan: Dict[str, Any], obj_meta: Dict[str, Dict[str, Any]
     exc_col_1    = plan["bo_exception_col"] + 1
 
     total_rows = plan["row_count"] + (plan.get("inserted_rows", 0) or 0)
-    cols_to_unmerge = [name_col_1, common_col_1, hard_col_1, exc_col_1, plan["validation_col"] + 1]
-    if plan.get("no_col") is not None:    cols_to_unmerge.append(plan["no_col"] + 1)
-    if plan.get("check_col") is not None: cols_to_unmerge.append(plan["check_col"] + 1)
-    _unmerge_verticals_in_section(ws, plan["start_row_excel"], plan["start_row_excel"] + total_rows - 1, cols_to_unmerge)
-
-    # Case-sensitive Common Object match
     common_set = set(common_objects or set())
 
     for offset in range(total_rows):
@@ -1046,11 +1077,11 @@ def write_bo_extras(ws, plan: Dict[str, Any], obj_meta: Dict[str, Dict[str, Any]
         if not nm:
             continue
 
-        # Common Object: Yes/No
+        # Common Object: Yes/No (case-sensitive list)
         if common_set:
             ws.range((row, common_col_1)).value = "Yes" if nm in common_set else "No"
 
-        meta = obj_meta.get(nm) or {k: v for k, v in obj_meta.items() if _to_space(k).strip() == nm}
+        meta = obj_meta.get(nm) or next((v for k, v in obj_meta.items() if _to_space(k).strip() == nm), None)
         meta = meta if isinstance(meta, dict) else None
         if not meta:
             continue
@@ -1111,13 +1142,16 @@ def _all_processes_published(proc_meta: Dict[str, Dict[str, Any]]) -> bool:
     return True
 
 def _insert_section_columns_if_needed(ws, plan: Dict[str, Any]) -> None:
-    """Insert per-section extra columns exactly once."""
+    """No column insert anymore. Configure header cells in-place and remember their indices."""
     if plan["type"] == "process" and "published_col" not in plan:
-        _insert_process_extra_columns(ws, plan)
-        _write_process_extra_headers(ws, plan)
+        _configure_process_headers_in_place(ws, plan)
     elif plan["type"] == "business_object" and "bo_common_col" not in plan:
-        _insert_bo_extra_columns(ws, plan)
-        _write_bo_extra_headers(ws, plan)
+        _configure_bo_headers_in_place(ws, plan)
+    elif plan["type"] == "environment_variable_prod":
+        # Make sure Validation header exists at plan["validation_col"]
+        row = plan["header_excel_row"]
+        _prepare_new_header_cell(ws, row, plan["validation_col"] + 1)
+        ws.range((row, plan["validation_col"] + 1)).value = "Validation"
 
 def validate_and_write_dynamic(excel_path: str, sheet_arg,
                                xml_proc: List[str], xml_bo: List[str],
@@ -1215,11 +1249,12 @@ def validate_and_write_dynamic(excel_path: str, sheet_arg,
                     if key_name in plan and isinstance(plan[key_name], int):
                         plan[key_name] += total_inserted_above
 
-                # Insert per-section extra columns ONCE
+                # Configure per-section header cells IN-PLACE (no insert)
                 _insert_section_columns_if_needed(ws, plan)
 
-                # Write "Validation" header text (do NOT clear fill here; keep existing)
+                # Ensure "Validation" header text
                 validation_col_1based = plan["validation_col"] + 1
+                _prepare_new_header_cell(ws, plan["header_excel_row"], validation_col_1based)
                 ws.range((plan["header_excel_row"], validation_col_1based)).value = "Validation"
 
                 # Existing rows' validation
@@ -1228,10 +1263,6 @@ def validate_and_write_dynamic(excel_path: str, sheet_arg,
 
                 rows_added_here = 0
                 if plan["type"] in ("process", "business_object", "environment_variable_prod"):
-                    _unmerge_verticals_in_section(
-                        ws, plan["start_row_excel"], plan["start_row_excel"] + plan["row_count"] - 1,
-                        [plan["name_col"] + 1, plan["validation_col"] + 1]
-                    )
                     consumed_count = fill_into_blanks_name_table(ws, plan, plan["missing"])
                     remaining_names = plan["missing"][consumed_count:]
                     rows_added_here = insert_new_rows_name_table(ws, plan, remaining_names)
@@ -1258,7 +1289,7 @@ def validate_and_write_dynamic(excel_path: str, sheet_arg,
 
                 total_inserted_above += rows_added_here
 
-                # Alignment/wrapping, no background fill propagation
+                # Alignment/wrapping/widths (section-only)
                 hdr_map = _header_index_map(ws, plan["header_excel_row"])
                 to_wrap = []
                 for label in ("published status","hard coded values","exception types","common object","validation"):
